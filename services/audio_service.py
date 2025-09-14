@@ -1,8 +1,12 @@
 import subprocess
 import os
+import time
 from typing import Optional
 from abc import ABC, abstractmethod
 from config import Config
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class AudioExtractor(ABC):
@@ -28,6 +32,7 @@ class FFmpegAudioExtractor(AudioExtractor):
     
     def __init__(self):
         self.ffmpeg_path = Config.FFMPEG_PATH
+        logger.info(f"FFmpegAudioExtractor initialized with path: {self.ffmpeg_path}")
     
     def extract_audio(self, video_path: str, output_path: str) -> bool:
         """
@@ -40,9 +45,15 @@ class FFmpegAudioExtractor(AudioExtractor):
         Returns:
             bool: True if extraction was successful, False otherwise
         """
+        start_time = time.time()
+        logger.info(f"Starting audio extraction from {video_path} to {output_path}")
+        
         try:
             # Create output directory if it doesn't exist
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            output_dir = os.path.dirname(output_path)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+                logger.debug(f"Created output directory: {output_dir}")
             
             # FFmpeg command to extract audio
             cmd = [
@@ -55,6 +66,8 @@ class FFmpegAudioExtractor(AudioExtractor):
                 output_path
             ]
             
+            logger.debug(f"FFmpeg command: {' '.join(cmd)}")
+            
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -62,14 +75,26 @@ class FFmpegAudioExtractor(AudioExtractor):
                 check=True
             )
             
-            return os.path.exists(output_path)
+            success = os.path.exists(output_path)
+            duration = time.time() - start_time
+            
+            if success:
+                file_size = os.path.getsize(output_path)
+                logger.info(f"Audio extraction successful in {duration:.2f}s, output size: {file_size} bytes")
+            else:
+                logger.error("Audio extraction failed - output file not created")
+            
+            return success
             
         except subprocess.CalledProcessError as e:
-            print(f"FFmpeg error: {e}")
-            print(f"FFmpeg stderr: {e.stderr}")
+            duration = time.time() - start_time
+            logger.error(f"FFmpeg error after {duration:.2f}s: {e}")
+            logger.error(f"FFmpeg stderr: {e.stderr}")
+            logger.error(f"FFmpeg stdout: {e.stdout}")
             return False
         except Exception as e:
-            print(f"Unexpected error during audio extraction: {e}")
+            duration = time.time() - start_time
+            logger.error(f"Unexpected error during audio extraction after {duration:.2f}s: {e}", exc_info=True)
             return False
 
 
@@ -78,6 +103,7 @@ class AudioService:
     
     def __init__(self, extractor: Optional[AudioExtractor] = None):
         self.extractor = extractor or FFmpegAudioExtractor()
+        logger.info(f"AudioService initialized with extractor: {type(self.extractor).__name__}")
     
     def extract_audio_from_video(self, video_path: str, output_path: str) -> bool:
         """
@@ -90,4 +116,7 @@ class AudioService:
         Returns:
             bool: True if extraction was successful, False otherwise
         """
-        return self.extractor.extract_audio(video_path, output_path)
+        logger.info(f"AudioService: Starting extraction from {video_path} to {output_path}")
+        result = self.extractor.extract_audio(video_path, output_path)
+        logger.info(f"AudioService: Extraction result: {result}")
+        return result
