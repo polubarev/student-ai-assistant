@@ -19,6 +19,19 @@ logger = get_logger(__name__)
 
 
 def main():
+    # --- persist workflow flags across reruns ---
+    st.session_state.setdefault("processing_started", False)
+    st.session_state.setdefault("transcription_started", False)
+    st.session_state.setdefault("audio_path", None)
+    st.session_state.setdefault("video_bytes", None)
+    st.session_state.setdefault("video_name", None)
+    st.session_state.setdefault("assemblyai_key", None)
+    st.session_state.setdefault("openai_key", None)
+    st.session_state.setdefault("language", None)
+    st.session_state.setdefault("openai_model", None)
+    st.session_state.setdefault("show_transcription_before_summary", False)
+    st.session_state.setdefault("transcription_displayed", False)
+
     logger.info("Starting Video Audio Processor application")
     
     st.set_page_config(
@@ -86,10 +99,16 @@ def main():
             index=default_model_index,
             help="Select the OpenAI model for text processing"
         )
+        
+        st.session_state.show_transcription_before_summary = st.checkbox(
+            "Show transcription before summary",
+            value=st.session_state.show_transcription_before_summary,
+            help="If checked, the full transcription will be displayed after processing, allowing you to review it before generating the AI summary."
+        )
     
     # Main content area
     col1, col2 = st.columns([1, 1])
-    
+
     with col1:
         st.header("📁 Upload Video")
         
@@ -103,7 +122,7 @@ def main():
             st.success(f"File uploaded: {uploaded_file.name}")
             st.info(f"File size: {uploaded_file.size / (1024*1024):.2f} MB")
             logger.info(f"File uploaded: {uploaded_file.name}, size: {uploaded_file.size} bytes")
-    
+
     with col2:
         st.header("⚙️ Processing Status")
         
@@ -113,109 +132,145 @@ def main():
             elif not openai_key:
                 st.error("Please enter your OpenAI API key in the sidebar")
             else:
-                if st.button("🚀 Process Video", type="primary"):
+                # Phase 0: user initiates processing. Store inputs in session, then rerun.
+                if st.button("🚀 Process Video", type="primary", key="btn_process"):
                     logger.info(f"Starting video processing for file: {uploaded_file.name}")
-                    process_video(uploaded_file, assemblyai_key, openai_key, language, openai_model)
+                    st.session_state.processing_started = True
+                    st.session_state.transcription_started = False
+                    st.session_state.audio_path = None
+                    st.session_state.video_bytes = uploaded_file.getvalue()
+                    st.session_state.video_name = uploaded_file.name
+                    st.session_state.assemblyai_key = assemblyai_key
+                    st.session_state.openai_key = openai_key
+                    st.session_state.language = language
+                    st.session_state.openai_model = openai_model
+                    st.rerun()
         else:
             st.info("Upload a video file to begin processing")
 
+    # If processing has started, continue the workflow on every rerun
+    if st.session_state.get("processing_started"):
+        process_video(
+            video_name=st.session_state.video_name,
+            video_bytes=st.session_state.video_bytes,
+            assemblyai_key=st.session_state.assemblyai_key,
+            openai_key=st.session_state.openai_key,
+            language=st.session_state.language,
+            openai_model=st.session_state.openai_model
+        )
 
-def process_video(uploaded_file, assemblyai_key, openai_key, language, openai_model):
-    """Process the uploaded video through the complete pipeline."""
+
+def process_video(video_name, video_bytes, assemblyai_key, openai_key, language, openai_model):
+    """Process the uploaded video through the complete pipeline with session-persisted phases."""
     start_time = time.time()
-    logger.info(f"Processing video: {uploaded_file.name} with language: {language}, model: {openai_model}")
-    
-    # Create temporary directory for processing
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
-        logger.debug(f"Created temporary directory: {temp_path}")
-        
-        # Save uploaded file
-        video_path = temp_path / uploaded_file.name
-        with open(video_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        logger.info(f"Saved uploaded file to: {video_path}")
-        
-        # Initialize progress tracking
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        try:
-            # Step 1: Extract audio
+    logger.info(f"Processing video: {video_name} with language: {language}, model: {openai_model}")
+
+    # UI elements survive reruns logically, not physically; recreate each run
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    try:
+        # Create (or reuse) a durable per-session temp folder so paths survive reruns
+        session_tmp_root = Path(tempfile.gettempdir()) / f"vap_{os.getpid()}_{id(st.session_state)}"
+        session_tmp_root.mkdir(parents=True, exist_ok=True)
+        logger.debug(f"Session temp dir: {session_tmp_root}")
+
+        # Persist the uploaded video to disk if it's not already there
+        video_path = session_tmp_root / video_name
+        if not video_path.exists():
+            with open(video_path, "wb") as f:
+                f.write(video_bytes)
+            logger.info(f"Saved uploaded file to: {video_path}")
+
+        # Step 1: Extract audio once; cache path in session state
+        if not st.session_state.get("audio_path"):
             status_text.text("🎵 Extracting audio from video...")
             progress_bar.progress(20)
             logger.info("Starting audio extraction")
-            
-            audio_path = temp_path / "audio.wav"
+
+            audio_path = session_tmp_root / "audio.wav"
             audio_service = AudioService(FFmpegAudioExtractor())
-            
-            audio_start_time = time.time()
             if not audio_service.extract_audio_from_video(str(video_path), str(audio_path)):
                 logger.error("Failed to extract audio from video")
                 st.error("Failed to extract audio from video. Please check if FFmpeg is installed.")
+                st.session_state.processing_started = False
                 return
-            
-            audio_duration = time.time() - audio_start_time
-            logger.info(f"Audio extraction completed in {audio_duration:.2f}s")
+
+            st.session_state.audio_path = str(audio_path)
+            logger.info("Audio extraction completed")
             st.success("✅ Audio extracted successfully")
-            
-            # Step 2: Transcribe audio
+
+        # Preview & confirm
+        st.subheader("🎧 Listen to Extracted Audio")
+        st.info("Listen to the extracted audio below. If you are satisfied, click the button to proceed with transcription and summarization.")
+        st.audio(st.session_state.audio_path, format='audio/wav')
+
+        if not st.session_state.get("transcription_started", False):
+            if st.button("📝 Yes, Proceed with Transcription and Summarization", type="primary", key="btn_confirm_transcribe"):
+                st.session_state.transcription_started = True
+                st.rerun()
+            # Wait for user confirmation
+            return
+
+        # Step 2: Transcribe
+        with st.spinner("Transcription and summarization in progress..."):
             status_text.text("🎤 Transcribing audio...")
             progress_bar.progress(50)
             logger.info("Starting audio transcription")
-            
-            transcription_service = TranscriptionService(
-                AssemblyAIProvider(assemblyai_key)
-            )
-            
+
+            transcription_service = TranscriptionService(AssemblyAIProvider(assemblyai_key))
             transcription_config = Config.get_transcription_config(language)
-            logger.debug(f"Transcription config: {transcription_config}")
-            
-            transcription_start_time = time.time()
-            transcript = transcription_service.transcribe_audio(
-                str(audio_path), 
-                transcription_config
-            )
-            
-            transcription_duration = time.time() - transcription_start_time
-            logger.info(f"Transcription completed in {transcription_duration:.2f}s, length: {len(transcript)} characters")
+            transcript = transcription_service.transcribe_audio(st.session_state.audio_path, transcription_config)
+            logger.info(f"Transcription completed, length: {len(transcript)} characters")
             st.success("✅ Audio transcribed successfully")
-            
-            # Step 3: Process with LLM
-            status_text.text("🤖 Generating summary with AI...")
-            progress_bar.progress(80)
-            logger.info("Starting LLM processing for summary generation")
-            
-            openai_config = Config.get_openai_config()
-            logger.debug(f"OpenAI config: {openai_config}")
-            
-            llm_service = LLMService(
-                api_key=openai_key, model=openai_model, **openai_config
-            )
-            
-            llm_start_time = time.time()
-            summary = llm_service.summarize_text(transcript)
-            
-            llm_duration = time.time() - llm_start_time
-            logger.info(f"LLM processing completed in {llm_duration:.2f}s, summary length: {len(summary)} characters")
-            
-            total_duration = time.time() - start_time
-            logger.info(f"Total processing time: {total_duration:.2f}s")
-            
-            progress_bar.progress(100)
-            status_text.text("✅ Processing complete!")
-            
-            # Display results
-            display_results(transcript, summary)
-            
-        except Exception as e:
-            logger.error(f"Error during video processing: {str(e)}", exc_info=True)
-            st.error(f"❌ Error during processing: {str(e)}")
-            progress_bar.progress(0)
-            status_text.text("Processing failed")
+
+            # Store transcript in session state
+            st.session_state.transcript = transcript
+
+            # Step 2.5: Optionally display transcription before summary
+            if st.session_state.show_transcription_before_summary and not st.session_state.get("summary_started", False):
+                status_text.text("📝 Reviewing transcription...")
+                st.subheader("📝 Full Transcription")
+                st.text_area(
+                    "Review the transcribed text below. Click 'Proceed to Summary' when ready.",
+                    value=transcript,
+                    height=400,
+                    help="Full transcription of the audio from your video"
+                )
+                if st.button("➡️ Proceed to Summary", type="primary", key="btn_proceed_summary"):
+                    st.session_state.summary_started = True
+                    st.rerun()
+                return # Stop execution here, wait for user to proceed
+
+            # Step 3: Summarize (only if transcription reviewed or option is off)
+            if not st.session_state.show_transcription_before_summary or st.session_state.get("summary_started", False):
+                status_text.text("🤖 Generating summary with AI...")
+                progress_bar.progress(80)
+                logger.info("Starting LLM processing for summary generation")
+
+                openai_config = Config.get_openai_config()
+                llm_service = LLMService(api_key=openai_key, model=openai_model, **openai_config)
+                summary = llm_service.summarize_text(st.session_state.transcript)
+                logger.info(f"LLM processing completed, summary length: {len(summary)} characters")
+
+                progress_bar.progress(100)
+                status_text.text("✅ Processing complete!")
+
+                total_duration = time.time() - start_time
+                logger.info(f"Total processing time: {total_duration:.2f}s")
+
+                # Display results
+                display_results(st.session_state.transcript, summary, total_duration)
+
+    except Exception as e:
+        logger.error(f"Error during video processing: {str(e)}", exc_info=True)
+        st.error(f"❌ Error during processing: {str(e)}")
+        progress_bar.progress(0)
+        st.session_state.processing_started = False
+        status_text.text("Processing failed")
 
 
-def display_results(transcript, summary):
+def display_results(transcript, summary, total_duration):
     """Display the transcription and summary results."""
     logger.info("Displaying processing results")
     
@@ -260,7 +315,7 @@ def display_results(transcript, summary):
     
     # Statistics
     st.subheader("📊 Statistics")
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         st.metric("Transcript Length", f"{len(transcript)} characters")
@@ -270,6 +325,9 @@ def display_results(transcript, summary):
     
     with col3:
         st.metric("Summary Length", f"{len(summary)} characters")
+    
+    with col4:
+        st.metric("Processing Time", f"{total_duration:.2f}s")
 
 
 if __name__ == "__main__":
