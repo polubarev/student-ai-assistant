@@ -32,8 +32,25 @@ class FFmpegAudioExtractor(AudioExtractor):
     
     def __init__(self):
         self.ffmpeg_path = Config.FFMPEG_PATH
-        logger.info(f"FFmpegAudioExtractor initialized with path: {self.ffmpeg_path}")
-    
+        self.ffprobe_path = self.ffmpeg_path.replace("ffmpeg", "ffprobe")
+        logger.info(f"FFmpegAudioExtractor initialized with ffmpeg path: {self.ffmpeg_path} and ffprobe path: {self.ffprobe_path}")
+
+    def _has_audio_stream(self, video_path: str) -> bool:
+        """Check if the video file has an audio stream using ffprobe."""
+        try:
+            cmd = [
+                self.ffprobe_path,
+                "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=codec_type",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return result.stdout.strip() == "audio"
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+
     def extract_audio(self, video_path: str, output_path: str) -> bool:
         """
         Extract audio from video using FFmpeg.
@@ -47,6 +64,10 @@ class FFmpegAudioExtractor(AudioExtractor):
         """
         start_time = time.time()
         logger.info(f"Starting audio extraction from {video_path} to {output_path}")
+
+        if not self._has_audio_stream(video_path):
+            logger.warning(f"No audio stream found in {video_path}. Skipping extraction.")
+            return False
         
         try:
             # Create output directory if it doesn't exist

@@ -4,3 +4,5 @@ langchain-openai>=0.1.0
 langchain-core>=0.2.0
 pathlib2>=2.3.7
 python-dotenv>=1.0.0
+pytest>=8.2.2
+pytest-mock>=3.14.0

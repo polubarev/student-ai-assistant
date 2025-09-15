@@ -6,7 +6,7 @@ import time
 
 from services.audio_service import AudioService, FFmpegAudioExtractor
 from services.transcription_service import TranscriptionService, AssemblyAIProvider
-from services.llm_service import LLMService, OpenAIProvider
+from services.llm_service import LLMService
 from config import Config
 from utils.logger import get_logger, Logger
 
@@ -190,7 +190,7 @@ def process_video(uploaded_file, assemblyai_key, openai_key, language, openai_mo
             logger.debug(f"OpenAI config: {openai_config}")
             
             llm_service = LLMService(
-                OpenAIProvider(api_key=openai_key, model=openai_model, **openai_config)
+                api_key=openai_key, model=openai_model, **openai_config
             )
             
             llm_start_time = time.time()
