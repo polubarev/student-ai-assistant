@@ -7,6 +7,6 @@
   - option to check transcript
   - button for text to summary
   - option to check the summary
-  - button for downloding summary
+  - button for downloading summary
 - bug when click Download Summary it runs transcript and summary again
 - in the sidebar option to change the system prompt
