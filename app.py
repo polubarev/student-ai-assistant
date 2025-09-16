@@ -133,7 +133,7 @@ def sidebar_config():
         # New: system prompt editor
         system_prompt = st.text_area(
             "System Prompt",
-            value=st.session_state.get("system_prompt", "You are a concise assistant. Generate a clear, factual summary."),
+            value=st.session_state.get("system_prompt", ""),
             height=140,
             help="Customize the system prompt used by the summarizer",
         )
@@ -159,35 +159,32 @@ def sidebar_config():
 # -------------------------
 
 def step_upload_and_prepare():
-    col1, col2 = st.columns([1, 1])
+    st.header("📁 Upload Video")
+    uploaded_file = st.file_uploader(
+        "Choose a video file",
+        type=["mp4", "avi", "mov", "mkv", "wmv", "flv", "webm"],
+        help="Supported formats: MP4, AVI, MOV, MKV, WMV, FLV, WebM",
+    )
+    if uploaded_file is not None:
+        st.success(f"File uploaded: {uploaded_file.name}")
+        st.info(f"File size: {uploaded_file.size / (1024*1024):.2f} MB")
 
-    with col1:
-        st.header("📁 Upload Video")
-        uploaded_file = st.file_uploader(
-            "Choose a video file",
-            type=["mp4", "avi", "mov", "mkv", "wmv", "flv", "webm"],
-            help="Supported formats: MP4, AVI, MOV, MKV, WMV, FLV, WebM",
-        )
-        if uploaded_file is not None:
-            st.success(f"File uploaded: {uploaded_file.name}")
-            st.info(f"File size: {uploaded_file.size / (1024*1024):.2f} MB")
+        # Detect a new file and reset workflow
+        data = uploaded_file.getvalue()
+        sig = file_signature(uploaded_file.name, data)
+        if st.session_state.get("file_sig") and st.session_state.file_sig != sig:
+            reset_workflow(preserve_keys=True)
+            st.toast("New file detected. Workflow reset.")
 
-            # Detect a new file and reset workflow
-            data = uploaded_file.getvalue()
-            sig = file_signature(uploaded_file.name, data)
-            if st.session_state.get("file_sig") and st.session_state.file_sig != sig:
-                reset_workflow(preserve_keys=True)
-                st.toast("New file detected. Workflow reset.")
+        st.session_state.video_bytes = data
+        st.session_state.video_name = uploaded_file.name
+        st.session_state.file_sig = sig
 
-            st.session_state.video_bytes = data
-            st.session_state.video_name = uploaded_file.name
-            st.session_state.file_sig = sig
-
-    with col2:
+    # The processing status and controls are now part of the main column
+    with st.container():
         st.header("⚙️ Processing Status")
 
         # Key presence checks
-        missing_any_key = not (st.session_state.get("assemblyai_key") and st.session_state.get("openai_key"))
         if st.session_state.get("video_bytes") is None:
             st.info("Upload a video file to begin processing")
             return
@@ -198,24 +195,23 @@ def step_upload_and_prepare():
             st.error("Please enter your OpenAI API key in the sidebar")
             return
 
-        # Start button only sets step to 0 and persists file on disk.
-        if st.button("🚀 Start Workflow", type="primary"):
-            # Save the uploaded file to a durable temp file
-            session_tmp_root = ensure_session_tmpdir()
-            video_path = session_tmp_root / st.session_state.video_name
-            if not video_path.exists():
-                with open(video_path, "wb") as f:
-                    f.write(st.session_state.video_bytes)
-            st.session_state.video_path = str(video_path)
-            st.session_state.step = 0
-            st.session_state.processing_started = True
-            st.success("Ready. Proceed to audio extraction.")
-            st.balloons()
-
-        # Convenience reset
-        if st.button("🔄 Start Over", help="Reset the workflow"):
-            reset_workflow(preserve_keys=True)
-            st.rerun()
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🚀 Start Process", type="primary"):
+                # Save the uploaded file to a durable temp file
+                session_tmp_root = ensure_session_tmpdir()
+                video_path = session_tmp_root / st.session_state.video_name
+                if not video_path.exists():
+                    with open(video_path, "wb") as f:
+                        f.write(st.session_state.video_bytes)
+                st.session_state.video_path = str(video_path)
+                st.session_state.step = 0
+                st.session_state.processing_started = True
+                st.success("Ready. Proceed to audio extraction.")
+        with col2:
+            if st.button("🔄 Start Over", help="Reset the workflow"):
+                reset_workflow(preserve_keys=True)
+                st.rerun()
 
 
 def step_extract_audio():
@@ -395,7 +391,8 @@ def main():
     st.session_state.setdefault("file_sig", None)
     st.session_state.setdefault("transcript", None)
     st.session_state.setdefault("summary", None)
-    st.session_state.setdefault("system_prompt", "You are a concise assistant. Generate a clear, factual summary.")
+    with open("data/system_prompt.md", "r") as f:
+        st.session_state.setdefault("system_prompt", f.read())
     st.session_state.setdefault("show_transcription_before_summary", False)
 
     st.set_page_config(page_title="Video Audio Processor", page_icon="🎥", layout="wide")
