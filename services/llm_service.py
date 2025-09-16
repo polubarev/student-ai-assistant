@@ -25,18 +25,20 @@ class LLMService:
         )
         logger.info(f"LLMService initialized with model: {model}")
 
-    def summarize_text(self, text: str) -> str:
+    def summarize_text(self, text: str, system_prompt: Optional[str] = None) -> str:
         """
         Summarize text using the configured LLM provider.
         
         Args:
             text: Input text to summarize
+            system_prompt: Optional system prompt to guide the summarization.
             
         Returns:
             str: Summary of the text
         """
-        system_prompt = '''You are a helpful assistant that creates concise and informative summaries. 
-        Please provide a clear, well-structured summary of the given text, highlighting the main points and key information.'''
+        if system_prompt is None:
+            system_prompt = '''You are a helpful assistant that creates concise and informative summaries. 
+            Please provide a clear, well-structured summary of the given text, highlighting the main points and key information.'''
         
         messages = [
             SystemMessage(content=system_prompt),

@@ -352,15 +352,10 @@ def step_summarize():
                     model=st.session_state.openai_model,
                     **openai_config,
                 )
-                # Try passing system prompt if supported
-                try:
-                    summary = llm_service.summarize_text(
-                        st.session_state.get("transcript") or "",
-                        system_prompt=st.session_state.get("system_prompt"),
-                    )
-                except TypeError:
-                    # Fallback for older LLMService signature
-                    summary = llm_service.summarize_text(st.session_state.get("transcript") or "")
+                summary = llm_service.summarize_text(
+                    st.session_state.get("transcript") or "",
+                    system_prompt=st.session_state.get("system_prompt"),
+                )
             st.session_state.summary = summary
             st.session_state.step = max(st.session_state.get("step", 0), 3)
             st.toast("Summary generated.")
@@ -399,10 +394,9 @@ def section_results():
     if summary_text:
         with tab2:
             st.subheader("AI-Generated Summary")
-            st.text_area(
-                "Summary",
-                value=summary_text,
-                height=300,
+            st.markdown(
+                summary_text,
+                unsafe_allow_html=True,
             )
             st.download_button(
                 label="📥 Download Summary",
