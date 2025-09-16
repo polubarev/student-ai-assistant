@@ -53,6 +53,9 @@ def reset_workflow(preserve_keys: bool = True):
         ]:
             keep[k] = st.session_state.get(k)
 
+    # Store system prompt before clearing
+    system_prompt_content = st.session_state.get("system_prompt")
+
     st.session_state.clear()
 
     # Restore preserved values and base state
@@ -64,12 +67,15 @@ def reset_workflow(preserve_keys: bool = True):
         "audio_path": None,
         "video_bytes": None,
         "video_name": None,
+        "video_path": None,
         "file_sig": None,
         "transcript": None,
         "summary": None,
         "transcription_displayed": False,
         **keep,
     })
+    if system_prompt_content:
+        st.session_state.system_prompt = system_prompt_content
 
 
 # -------------------------
@@ -159,59 +165,86 @@ def sidebar_config():
 # -------------------------
 
 def step_upload_and_prepare():
-    st.header("📁 Upload Video")
+    st.header("📁 Upload File")
     uploaded_file = st.file_uploader(
-        "Choose a video file",
-        type=["mp4", "avi", "mov", "mkv", "wmv", "flv", "webm"],
-        help="Supported formats: MP4, AVI, MOV, MKV, WMV, FLV, WebM",
+        "Choose a video, audio, or transcript file",
+        type=["mp4", "avi", "mov", "mkv", "wmv", "flv", "webm", "mp3", "wav", "m4a", "txt"],
+        help="Supported formats: Video (mp4, avi, ...), Audio (mp3, wav, ...), Text (txt)",
     )
+
     if uploaded_file is not None:
         st.success(f"File uploaded: {uploaded_file.name}")
         st.info(f"File size: {uploaded_file.size / (1024*1024):.2f} MB")
 
-        # Detect a new file and reset workflow
         data = uploaded_file.getvalue()
         sig = file_signature(uploaded_file.name, data)
+
         if st.session_state.get("file_sig") and st.session_state.file_sig != sig:
             reset_workflow(preserve_keys=True)
             st.toast("New file detected. Workflow reset.")
 
-        st.session_state.video_bytes = data
-        st.session_state.video_name = uploaded_file.name
         st.session_state.file_sig = sig
+        file_type = uploaded_file.type
 
-    # The processing status and controls are now part of the main column
+        # Reset paths and content
+        st.session_state.video_path = None
+        st.session_state.audio_path = None
+        st.session_state.transcript = None
+        st.session_state.video_bytes = None
+        st.session_state.video_name = None
+
+        session_tmp_root = ensure_session_tmpdir()
+
+        if "video" in file_type:
+            st.session_state.video_bytes = data
+            st.session_state.video_name = uploaded_file.name
+            video_path = session_tmp_root / st.session_state.video_name
+            if not video_path.exists():
+                with open(video_path, "wb") as f:
+                    f.write(st.session_state.video_bytes)
+            st.session_state.video_path = str(video_path)
+            st.session_state.step = 0
+            st.session_state.processing_started = True
+            st.success("Video loaded. Ready for audio extraction.")
+
+        elif "audio" in file_type:
+            audio_path = session_tmp_root / uploaded_file.name
+            if not audio_path.exists():
+                with open(audio_path, "wb") as f:
+                    f.write(data)
+            st.session_state.audio_path = str(audio_path)
+            st.session_state.step = 1  # Skip audio extraction
+            st.session_state.processing_started = True
+            st.success("Audio loaded. Ready for transcription.")
+
+        elif "text" in file_type:
+            try:
+                transcript = data.decode("utf-8")
+                st.session_state.transcript = transcript
+                st.session_state.step = 2  # Skip extraction and transcription
+                st.session_state.processing_started = True
+                st.success("Transcript loaded. Ready for summarization.")
+            except UnicodeDecodeError:
+                st.error("Could not decode the text file. Please ensure it is UTF-8 encoded.")
+                return
+
     with st.container():
         st.header("⚙️ Processing Status")
 
-        # Key presence checks
-        if st.session_state.get("video_bytes") is None:
-            st.info("Upload a video file to begin processing")
-            return
-        if not st.session_state.get("assemblyai_key"):
-            st.error("Please enter your AssemblyAI API key in the sidebar")
-            return
-        if not st.session_state.get("openai_key"):
-            st.error("Please enter your OpenAI API key in the sidebar")
+        if not st.session_state.get("processing_started"):
+            st.info("Upload a file to begin.")
             return
 
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("🚀 Start Process", type="primary"):
-                # Save the uploaded file to a durable temp file
-                session_tmp_root = ensure_session_tmpdir()
-                video_path = session_tmp_root / st.session_state.video_name
-                if not video_path.exists():
-                    with open(video_path, "wb") as f:
-                        f.write(st.session_state.video_bytes)
-                st.session_state.video_path = str(video_path)
-                st.session_state.step = 0
-                st.session_state.processing_started = True
-                st.success("Ready. Proceed to audio extraction.")
-        with col2:
-            if st.button("🔄 Start Over", help="Reset the workflow"):
-                reset_workflow(preserve_keys=True)
-                st.rerun()
+        if not st.session_state.get("assemblyai_key") and st.session_state.get("step", 0) < 2:
+            st.error("Please enter your AssemblyAI API key in the sidebar for transcription.")
+            return
+        if not st.session_state.get("openai_key"):
+            st.error("Please enter your OpenAI API key in the sidebar for summarization.")
+            return
+
+        if st.button("🔄 Start Over", help="Reset the workflow"):
+            reset_workflow(preserve_keys=True)
+            st.rerun()
 
 
 def step_extract_audio():
@@ -377,46 +410,41 @@ def section_results():
 # -------------------------
 
 def main():
-    logger.info("Starting Video Audio Processor application (wizard)")
+    logger.info("Starting Student AI Assistant application")
 
-    # Base state init (idempotent)
-    st.session_state.setdefault("step", 0)
-    st.session_state.setdefault("processing_started", False)
-    st.session_state.setdefault("transcription_started", False)
-    st.session_state.setdefault("summary_started", False)
-    st.session_state.setdefault("audio_path", None)
-    st.session_state.setdefault("video_bytes", None)
-    st.session_state.setdefault("video_name", None)
-    st.session_state.setdefault("video_path", None)
-    st.session_state.setdefault("file_sig", None)
-    st.session_state.setdefault("transcript", None)
-    st.session_state.setdefault("summary", None)
-    with open("data/system_prompt.md", "r") as f:
-        st.session_state.setdefault("system_prompt", f.read())
-    st.session_state.setdefault("show_transcription_before_summary", False)
+    # Base state init
+    if "step" not in st.session_state:
+        reset_workflow(preserve_keys=False)  # Full reset on first load
+        with open("data/system_prompt.md", "r") as f:
+            st.session_state.system_prompt = f.read()
 
-    st.set_page_config(page_title="Video Audio Processor", page_icon="🎥", layout="wide")
-    st.title("🎥 Video Audio Processor — Step-by-step")
-    st.markdown("Upload a video, extract audio, transcribe, and summarize — one clear step at a time.")
+    st.set_page_config(page_title="Student AI Assistant", page_icon="🎓", layout="wide")
+    st.title("🎓 Student AI Assistant")
+    st.markdown("Upload a video, audio, or transcript to get started.")
 
     sidebar_config()
 
     # Step 0: Upload & prepare
     step_upload_and_prepare()
 
-    # Step 1: Extract audio
-    step_extract_audio()
+    # Conditional UI based on progress
+    if st.session_state.get("processing_started"):
+        # Step 1: Extract audio (if video was uploaded)
+        if st.session_state.get("video_path"):
+            step_extract_audio()
 
-    # Gate for review-before-summary flow (only when requested)
-    step_review_transcript_gate()
+        # Step 2: Transcription (if audio is available)
+        if st.session_state.get("audio_path"):
+            step_transcribe()
 
-    # Step 2: Transcription
-    step_transcribe()
+        # Gate for review-before-summary flow
+        step_review_transcript_gate()
 
-    # Step 3: Summarization
-    step_summarize()
+        # Step 3: Summarization (if transcript is available)
+        if st.session_state.get("transcript"):
+            step_summarize()
 
-    # Results section (safe on reruns; no heavy work)
+    # Results section
     section_results()
 
 
