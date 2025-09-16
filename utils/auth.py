@@ -24,7 +24,9 @@ def check_password():
     # Add a login button
     if st.button("Login"):
         password_entered()
-        if not st.session_state.get("password_correct", False):
+        if st.session_state.get("password_correct", False):
+            st.rerun()
+        else:
             st.error("😕 User not known or password incorrect")
 
     return False
