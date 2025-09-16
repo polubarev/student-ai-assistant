@@ -1,4 +1,4 @@
 # TODO
 
-- allow upload also an audio itself
-- allow upload ready transcript
+- test container
+- deploy on cloud

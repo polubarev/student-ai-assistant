@@ -10,6 +10,7 @@ from services.transcription_service import TranscriptionService, AssemblyAIProvi
 from services.llm_service import LLMService
 from config import Config
 from utils.logger import get_logger, Logger
+from utils.auth import check_password
 
 # -------------------------
 # Logging
@@ -410,6 +411,9 @@ def section_results():
 # -------------------------
 
 def main():
+    if not check_password():
+        st.stop()
+
     logger.info("Starting Student AI Assistant application")
 
     # Base state init
