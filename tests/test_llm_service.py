@@ -4,54 +4,43 @@ from services.llm_service import LLMService
 
 
 @pytest.fixture
-def mock_chat_openai(mocker):  # mocker is a fixture provided by pytest-mock
-    """Fixture to mock the ChatOpenAI class."""
+def mock_openrouter_client(mocker):
+    """Fixture to mock the OpenRouter client class."""
     mock_instance = MagicMock()
-    mock_instance.invoke.return_value.content = "This is a mock summary."
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock(message=MagicMock(content="This is a mock summary."))]
+    mock_instance.chat.send.return_value = mock_response
 
-    # Patch the ChatOpenAI class in the llm_service module
-    mock_class = mocker.patch("services.llm_service.ChatOpenAI", return_value=mock_instance)
+    mock_class = mocker.patch("services.llm_service.OpenRouter", return_value=mock_instance)
     
     return mock_class, mock_instance
 
 
-def test_summarize_text_success(mock_chat_openai):
+def test_summarize_text_success(mock_openrouter_client):
     """Test that summarize_text returns a summary on successful API call."""
-    mock_class, mock_instance = mock_chat_openai
-
-    # Initialize the service. This will use the mocked ChatOpenAI.
+    mock_class, mock_instance = mock_openrouter_client
     llm_service = LLMService(api_key="fake_api_key")
 
-    # Call the method to be tested
     summary = llm_service.summarize_text("Some long text to summarize.")
 
-    # Assertions
-    # Check if ChatOpenAI was initialized correctly
-    mock_class.assert_called_once_with(
-        model="gpt-4o",
-        temperature=0,
-        max_tokens=None,
-        timeout=None,
-        max_retries=2,
-        api_key="fake_api_key"
-    )
-
-    # Check if the invoke method was called on the instance
-    mock_instance.invoke.assert_called_once()
-    
-    # Check that the summary is the one we faked
+    mock_class.assert_called_once_with(api_key="fake_api_key")
+    mock_instance.chat.send.assert_called_once()
+    send_kwargs = mock_instance.chat.send.call_args.kwargs
+    assert send_kwargs["model"] == "google/gemini-3-flash-preview"
+    assert send_kwargs["temperature"] == 0
+    assert send_kwargs["max_tokens"] is None
+    assert send_kwargs["retries"] == 2
+    assert send_kwargs["stream"] is False
     assert summary == "This is a mock summary."
 
 
-def test_summarize_text_api_error(mock_chat_openai):
+def test_summarize_text_api_error(mock_openrouter_client):
     """Test that summarize_text raises an error if the API call fails."""
-    mock_class, mock_instance = mock_chat_openai
+    _, mock_instance = mock_openrouter_client
 
-    # Configure the mock to raise an exception
-    mock_instance.invoke.side_effect = Exception("API Error")
+    mock_instance.chat.send.side_effect = Exception("API Error")
 
     llm_service = LLMService(api_key="fake_api_key")
 
-    # Assert that a RuntimeError is raised when the API call fails
     with pytest.raises(RuntimeError, match="LLM processing error: API Error"):
         llm_service.summarize_text("Some text.")

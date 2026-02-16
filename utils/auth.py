@@ -18,15 +18,15 @@ def check_password():
         return True
 
     # Show input fields
-    st.text_input("Username", key="username")
-    st.text_input("Password", type="password", key="password")
+    st.text_input("Логин", key="username")
+    st.text_input("Пароль", type="password", key="password")
 
     # Add a login button
-    if st.button("Login"):
+    if st.button("Войти"):
         password_entered()
         if st.session_state.get("password_correct", False):
             st.rerun()
         else:
-            st.error("😕 User not known or password incorrect")
+            st.error("😕 Неверный логин или пароль")
 
     return False
