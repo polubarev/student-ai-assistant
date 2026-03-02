@@ -11,6 +11,10 @@ REPOSITORY="${REPOSITORY:-student-ai-assistant-repo}"
 IMAGE_NAME="${IMAGE_NAME:-student-ai-assistant}"
 SERVICE_NAME="${SERVICE_NAME:-student-ai-assistant-service}"
 SERVICE_PORT="${SERVICE_PORT:-8501}"
+SERVICE_MEMORY="${SERVICE_MEMORY:-1Gi}"
+SERVICE_CPU="${SERVICE_CPU:-1}"
+SERVICE_TIMEOUT="${SERVICE_TIMEOUT:-600}"
+EXECUTION_ENVIRONMENT="${EXECUTION_ENVIRONMENT:-gen2}"
 
 ASSEMBLYAI_SECRET_NAME="${ASSEMBLYAI_SECRET_NAME:-assemblyai-api-key}"
 OPENROUTER_SECRET_NAME="${OPENROUTER_SECRET_NAME:-openrouter-api-key}"
@@ -81,6 +85,7 @@ upsert_secret() {
 }
 
 echo "Starting deploy with project=${PROJECT_ID}, region=${REGION}, service=${SERVICE_NAME}"
+echo "Cloud Run settings: memory=${SERVICE_MEMORY}, cpu=${SERVICE_CPU}, timeout=${SERVICE_TIMEOUT}s, env=${EXECUTION_ENVIRONMENT}"
 
 # Fill optional deploy config from .env when not provided as shell vars.
 if [[ -z "${GCS_SOURCE_BUCKET}" ]]; then
@@ -236,6 +241,10 @@ DEPLOY_CMD=(
   --allow-unauthenticated
   --port "${SERVICE_PORT}"
   --min-instances 0
+  --memory "${SERVICE_MEMORY}"
+  --cpu "${SERVICE_CPU}"
+  --timeout "${SERVICE_TIMEOUT}"
+  --execution-environment "${EXECUTION_ENVIRONMENT}"
   --service-account "${RUNTIME_SERVICE_ACCOUNT}"
   --project "${PROJECT_ID}"
 )

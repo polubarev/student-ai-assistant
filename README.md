@@ -10,7 +10,7 @@ A Streamlit application that extracts audio from videos, transcribes it using As
 - 🎤 **Speech Transcription**: Powered by AssemblyAI with support for multiple languages
 - 🤖 **AI Summarization**: Generates intelligent summaries via OpenRouter models
 - 📊 **Progress Tracking**: Real-time processing status and statistics
-- 📥 **Export Options**: Download transcripts and summaries as text files
+- 📥 **Export Options**: Download transcripts and summaries as TXT/PDF files
 
 ## Prerequisites
 
@@ -33,6 +33,10 @@ A Streamlit application that extracts audio from videos, transcribes it using As
    Or with pip:
    ```bash
    pip install -r requirements.txt
+   ```
+   Install Chromium for PDF export:
+   ```bash
+   python -m playwright install chromium
    ```
    For running tests locally:
    ```bash
@@ -72,13 +76,23 @@ A Streamlit application that extracts audio from videos, transcribes it using As
 5. View the results:
    - Full transcript in the "Full Transcript" tab
    - AI-generated summary in the "AI Summary" tab
-   - Download options for both transcript and summary
+   - Download options for both transcript and summary (TXT/PDF)
 
 ## Deployment
 
 For the production deployment flow (Podman + Cloud Run + Secret Manager) and troubleshooting notes from real failures, see:
 
 - [DEPLOYMENT.md](DEPLOYMENT.md)
+
+Quick update deploy:
+```bash
+bash deploy.sh
+```
+
+Optional Cloud Run resource overrides (useful for heavy PDF/summarization workloads):
+```bash
+SERVICE_MEMORY=2Gi SERVICE_CPU=2 SERVICE_TIMEOUT=900 bash deploy.sh
+```
 
 ## Project Structure
 

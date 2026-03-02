@@ -40,6 +40,168 @@ SOURCE_MODE_LOCAL = "Локальная загрузка"
 SOURCE_MODE_LARGE = "Большая загрузка"
 
 
+def format_size(size_bytes: int | float | None) -> str:
+    """Format byte size in human-readable units."""
+    if size_bytes is None:
+        return "—"
+    try:
+        size = float(size_bytes)
+    except (TypeError, ValueError):
+        return "—"
+    if size < 0:
+        return "—"
+    if size < 1024:
+        return f"{int(size)} B"
+    for unit in ("KB", "MB", "GB", "TB"):
+        size /= 1024
+        if size < 1024 or unit == "TB":
+            return f"{size:.2f} {unit}"
+    return "—"
+
+
+def build_summary_pdf_html(markdown_text: str) -> str:
+    """Render Markdown into a printable HTML document (GFM-like tables included)."""
+    try:
+        from markdown_it import MarkdownIt
+    except ImportError as exc:
+        raise RuntimeError(
+            "Для PDF-экспорта нужен пакет markdown-it-py. "
+            "Установите зависимости из requirements.txt."
+        ) from exc
+
+    md = MarkdownIt("commonmark", {"html": False})
+    md.enable(["table", "strikethrough"])
+    body_html = md.render(markdown_text or "")
+
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    @page {{
+      size: A4;
+      margin: 14mm 12mm;
+    }}
+    body {{
+      font-family: "Noto Sans", "DejaVu Sans", "Arial Unicode MS", "Arial", sans-serif;
+      font-size: 12px;
+      line-height: 1.5;
+      color: #111;
+      margin: 0;
+      word-break: break-word;
+    }}
+    h1, h2, h3, h4, h5, h6 {{
+      margin: 0.95em 0 0.45em;
+      line-height: 1.25;
+      page-break-after: avoid;
+    }}
+    h1 {{ font-size: 24px; }}
+    h2 {{ font-size: 20px; }}
+    h3 {{ font-size: 17px; }}
+    h4 {{ font-size: 15px; }}
+    h5 {{ font-size: 13px; }}
+    h6 {{ font-size: 12px; }}
+    p, ul, ol, pre, blockquote, table {{
+      margin: 0 0 0.8em;
+    }}
+    ul, ol {{
+      padding-left: 1.3em;
+    }}
+    code, pre {{
+      font-family: "SFMono-Regular", "Menlo", "Consolas", "Liberation Mono", monospace;
+    }}
+    code {{
+      background: #f4f4f4;
+      border-radius: 4px;
+      padding: 0.1em 0.3em;
+    }}
+    pre {{
+      background: #f7f7f7;
+      border: 1px solid #e4e4e4;
+      border-radius: 8px;
+      padding: 10px 12px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }}
+    pre code {{
+      background: transparent;
+      border-radius: 0;
+      padding: 0;
+    }}
+    blockquote {{
+      border-left: 4px solid #cccccc;
+      margin-left: 0;
+      padding-left: 12px;
+      color: #444444;
+    }}
+    hr {{
+      border: 0;
+      border-top: 1px solid #d9d9d9;
+      margin: 1.1em 0;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+      page-break-inside: avoid;
+    }}
+    th, td {{
+      border: 1px solid #d0d0d0;
+      padding: 8px 10px;
+      vertical-align: top;
+      text-align: left;
+      overflow-wrap: anywhere;
+    }}
+    th {{
+      background: #f3f5f7;
+      font-weight: 700;
+    }}
+    tr:nth-child(even) td {{
+      background: #fcfcfc;
+    }}
+  </style>
+</head>
+<body>
+{body_html}
+</body>
+</html>"""
+
+
+def build_summary_pdf_bytes(text: str) -> bytes:
+    """Build summary PDF with browser-grade rendering."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "Для PDF-экспорта нужен Playwright. "
+            "Установите зависимости и выполните: python -m playwright install chromium"
+        ) from exc
+
+    document_html = build_summary_pdf_html(text)
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            try:
+                page = browser.new_page()
+                page.set_content(document_html, wait_until="networkidle")
+                return page.pdf(
+                    format="A4",
+                    print_background=True,
+                    display_header_footer=False,
+                )
+            finally:
+                browser.close()
+    except Exception as exc:
+        raise RuntimeError(
+            "Не удалось запустить Chromium для PDF. "
+            "Проверьте установку: python -m playwright install chromium"
+        ) from exc
+
+
 def source_signature(*parts: str) -> str:
     h = hashlib.sha256()
     for part in parts:
@@ -622,6 +784,7 @@ def initialize_session_state():
         "input_source": None,
         "input_name": None,
         "input_size_bytes": None,
+        "results_tab_default": None,
         "gcs_upload_form": None,
         "handled_redirect_key": None,
         "transcript": None,
@@ -753,7 +916,7 @@ def sidebar_config():
             st.caption(f"Файл: {st.session_state.get('input_name')}")
             st.caption(f"Способ загрузки: {st.session_state.get('input_source')}")
             if st.session_state.get("input_size_bytes") is not None:
-                st.caption(f"Размер: {st.session_state.get('input_size_bytes') / (1024 * 1024):.2f} MB")
+                st.caption(f"Размер: {format_size(st.session_state.get('input_size_bytes'))}")
 
             if st.session_state.get("summary"):
                 st.info("Саммари готово.")
@@ -1053,6 +1216,7 @@ def step_summarize():
                     system_prompt=st.session_state.get("system_prompt"),
                 )
             st.session_state.summary = summary
+            st.session_state.results_tab_default = "📊 AI-саммари"
             st.session_state.step = max(st.session_state.get("step", 0), 3)
             st.toast("Саммари сгенерировано.")
         except Exception as e:
@@ -1066,7 +1230,21 @@ def section_results():
         return
 
     st.header("📋 Результаты")
-    tab1, tab2 = st.tabs(["📝 Полная транскрипция", "📊 AI-саммари"])
+    st.info(
+        "😄 Чтобы скачать саммари, доскролль до конца страницы и после скачивания закрывай сайт: "
+        "каждая минута, пока он открыт, стоит денег старшему брату."
+    )
+    tab_labels = ["📝 Полная транскрипция", "📊 AI-саммари"]
+    default_tab = st.session_state.get("results_tab_default")
+    if default_tab not in tab_labels:
+        default_tab = None
+    try:
+        tab1, tab2 = st.tabs(tab_labels, default=default_tab)
+    except TypeError:
+        tab1, tab2 = st.tabs(tab_labels)
+    if default_tab:
+        # Apply one-time auto-switch right after summary generation.
+        st.session_state.results_tab_default = None
 
     transcript_text = st.session_state.get("transcript") or ""
     summary_text = st.session_state.get("summary") or ""
@@ -1094,13 +1272,40 @@ def section_results():
                 summary_text,
                 unsafe_allow_html=True,
             )
-            st.download_button(
-                label="📥 Скачать саммари",
-                data=summary_text,
-                file_name="summary.txt",
-                mime="text/plain",
-                key="download_summary",
-            )
+            pdf_summary_bytes = None
+            pdf_export_error = None
+            try:
+                pdf_summary_bytes = build_summary_pdf_bytes(summary_text)
+            except Exception as e:
+                logger.exception("Failed to build summary PDF")
+                pdf_export_error = e
+
+            pdf_col, txt_col = st.columns([1.4, 1])
+            with pdf_col:
+                if pdf_summary_bytes:
+                    st.download_button(
+                        label="📥 Скачать саммари (.pdf)",
+                        data=pdf_summary_bytes,
+                        file_name="summary.pdf",
+                        mime="application/pdf",
+                        key="download_summary_pdf",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                else:
+                    st.caption("PDF-экспорт временно недоступен.")
+                    if pdf_export_error:
+                        st.caption(f"Причина: {pdf_export_error}")
+            with txt_col:
+                st.download_button(
+                    label="Скачать .txt (опционально)",
+                    data=summary_text,
+                    file_name="summary.txt",
+                    mime="text/plain",
+                    key="download_summary_txt",
+                    type="tertiary",
+                    use_container_width=True,
+                )
 
     # Stats
     if transcript_text or summary_text:

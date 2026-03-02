@@ -7,14 +7,16 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     UV_PYTHON_DOWNLOADS=never \
-    UV_LINK_MODE=copy
+    UV_LINK_MODE=copy \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 # Install uv (fast Python package installer)
 COPY --from=ghcr.io/astral-sh/uv:0.7.22 /uv /uvx /bin/
 
-# Install only required system dependency
+# Install base system dependency
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user for security
@@ -28,6 +30,11 @@ COPY requirements.txt .
 
 # Install Python dependencies with uv (faster than pip)
 RUN uv pip install --system --no-cache -r requirements.txt
+
+# Install Chromium for Playwright-based Markdown->PDF rendering
+RUN mkdir -p "${PLAYWRIGHT_BROWSERS_PATH}" \
+    && playwright install --with-deps chromium \
+    && chmod -R a+rX "${PLAYWRIGHT_BROWSERS_PATH}"
 
 # Copy application code
 COPY . .

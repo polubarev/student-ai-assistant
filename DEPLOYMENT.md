@@ -10,6 +10,7 @@ This runbook documents the deployment path that worked and the errors to avoid.
 - Runtime: Cloud Run (`min-instances=0`)
 - Secrets: Google Secret Manager (`assemblyai-api-key`, `openrouter-api-key`)
 - Image build/push: Podman (local)
+- PDF export: Playwright + Chromium (installed in image build)
 
 ## Why This Path
 
@@ -67,11 +68,28 @@ The script now does all of this:
 - ensures repository exists
 - authenticates Podman to Artifact Registry
 - builds + pushes image
+- installs Chromium in the image for Markdown->PDF export
 - creates/updates secret versions from env values
 - grants secret access to Cloud Run runtime service account
 - grants `roles/iam.serviceAccountTokenCreator` on runtime service account (required for signed browser upload forms)
 - configures bucket CORS for your app origin (required when upload uses signed `PUT` fallback)
 - deploys Cloud Run with secret bindings and `min-instances=0`
+
+## Cloud Run Resource Knobs
+
+`deploy.sh` supports these optional env vars:
+
+- `SERVICE_MEMORY` (default: `1Gi`)
+- `SERVICE_CPU` (default: `1`)
+- `SERVICE_TIMEOUT` in seconds (default: `600`)
+- `EXECUTION_ENVIRONMENT` (`gen1` or `gen2`, default: `gen2`)
+
+Example:
+```bash
+SERVICE_MEMORY=2Gi SERVICE_CPU=2 SERVICE_TIMEOUT=900 bash deploy.sh
+```
+
+This is useful if PDF export + long summarization requests need more headroom.
 
 ## API Key Handling
 
@@ -149,6 +167,12 @@ Expected minScale: `0`.
 5. `Blob object has no attribute generate_signed_post_policy_v4`
 - Cause: older `google-cloud-storage` runtime API surface.
 - Fix: app now falls back to signed `PUT` upload automatically. Redeploy latest code.
+
+6. PDF download fails with browser-not-found / launch errors
+- Cause: runtime can’t find Chromium binaries used by Playwright.
+- Fix:
+  - Use latest Dockerfile (sets shared `PLAYWRIGHT_BROWSERS_PATH` and installs Chromium in build).
+  - Rebuild and redeploy with `bash deploy.sh`.
 
 ## Security Notes
 
