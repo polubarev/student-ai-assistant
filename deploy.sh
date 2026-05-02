@@ -84,6 +84,38 @@ upsert_secret() {
   fi
 }
 
+destroy_old_secret_versions() {
+  local secret_name="$1"
+  local keep_count="${2:-1}"
+  local versions=()
+
+  if ! gcloud secrets describe "${secret_name}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+    return
+  fi
+
+  mapfile -t versions < <(
+    gcloud secrets versions list "${secret_name}" \
+      --project="${PROJECT_ID}" \
+      --filter="state=enabled OR state=disabled" \
+      --sort-by="~createTime" \
+      --format="value(name)"
+  )
+
+  if (( ${#versions[@]} <= keep_count )); then
+    echo "Secret ${secret_name}: ${#versions[@]} active version(s), nothing to clean up."
+    return
+  fi
+
+  echo "Secret ${secret_name}: keeping ${keep_count} newest active version(s), destroying older versions..."
+  for ((i = keep_count; i < ${#versions[@]}; i++)); do
+    gcloud secrets versions destroy "${versions[$i]}" \
+      --secret="${secret_name}" \
+      --project="${PROJECT_ID}" \
+      --quiet >/dev/null
+    echo "Destroyed old secret version: ${secret_name}/${versions[$i]}"
+  done
+}
+
 echo "Starting deploy with project=${PROJECT_ID}, region=${REGION}, service=${SERVICE_NAME}"
 echo "Cloud Run settings: memory=${SERVICE_MEMORY}, cpu=${SERVICE_CPU}, timeout=${SERVICE_TIMEOUT}s, env=${EXECUTION_ENVIRONMENT}"
 
@@ -280,6 +312,16 @@ if [[ -z "${APP_BASE_URL}" ]]; then
     --update-env-vars "APP_BASE_URL=${SERVICE_URL}" >/dev/null
   APP_BASE_URL="${SERVICE_URL}"
 fi
+
+echo "Removing legacy OPENAI_API_KEY secret binding if present..."
+gcloud run services update "${SERVICE_NAME}" \
+  --region "${REGION}" \
+  --project "${PROJECT_ID}" \
+  --remove-secrets "OPENAI_API_KEY" >/dev/null || true
+
+echo "Cleaning up old Secret Manager versions..."
+destroy_old_secret_versions "${ASSEMBLYAI_SECRET_NAME}" 1
+destroy_old_secret_versions "${OPENROUTER_SECRET_NAME}" 1
 
 if [[ -n "${GCS_UPLOAD_BUCKET}" && -n "${APP_BASE_URL}" ]]; then
   if [[ "${GCS_UPLOAD_BUCKET}" == gs://* ]]; then
