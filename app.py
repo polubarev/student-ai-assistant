@@ -15,6 +15,7 @@ from services.storage_service import GCSStorageService
 from config import Config
 from utils.logger import get_logger, Logger
 from utils.auth import check_password
+from utils.downloads import build_download_link
 
 # -------------------------
 # Logging
@@ -1257,12 +1258,11 @@ def section_results():
                 value=transcript_text,
                 height=300,
             )
-            st.download_button(
-                label="📥 Скачать транскрипцию",
-                data=transcript_text,
-                file_name="transcript.txt",
-                mime="text/plain",
-                key="download_transcript",
+            st.markdown(
+                build_download_link(
+                    transcript_text, "transcript.txt", "text/plain", "📥 Скачать транскрипцию"
+                ),
+                unsafe_allow_html=True,
             )
 
     if summary_text:
@@ -1283,28 +1283,23 @@ def section_results():
             pdf_col, txt_col = st.columns([1.4, 1])
             with pdf_col:
                 if pdf_summary_bytes:
-                    st.download_button(
-                        label="📥 Скачать саммари (.pdf)",
-                        data=pdf_summary_bytes,
-                        file_name="summary.pdf",
-                        mime="application/pdf",
-                        key="download_summary_pdf",
-                        type="primary",
-                        use_container_width=True,
+                    st.markdown(
+                        build_download_link(
+                            pdf_summary_bytes, "summary.pdf", "application/pdf",
+                            "📥 Скачать саммари (.pdf)",
+                        ),
+                        unsafe_allow_html=True,
                     )
                 else:
                     st.caption("PDF-экспорт временно недоступен.")
                     if pdf_export_error:
                         st.caption(f"Причина: {pdf_export_error}")
             with txt_col:
-                st.download_button(
-                    label="Скачать .txt (опционально)",
-                    data=summary_text,
-                    file_name="summary.txt",
-                    mime="text/plain",
-                    key="download_summary_txt",
-                    type="tertiary",
-                    use_container_width=True,
+                st.markdown(
+                    build_download_link(
+                        summary_text, "summary.txt", "text/plain", "Скачать .txt (опционально)"
+                    ),
+                    unsafe_allow_html=True,
                 )
 
     # Stats
