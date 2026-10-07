@@ -28,20 +28,18 @@ A Streamlit application that extracts audio from videos, transcribes it using As
 1. Clone or download this repository
 2. Install Python dependencies (recommended: `uv`):
    ```bash
-   uv pip install --system -r requirements.txt
+   uv pip install --system --require-hashes -r requirements.lock
    ```
    Or with pip:
    ```bash
-   pip install -r requirements.txt
+   pip install --require-hashes -r requirements.lock
    ```
-   Install Chromium for PDF export:
-   ```bash
-   python -m playwright install chromium
-   ```
+   PDF export uses WeasyPrint and Pango; the production image installs the native
+   libraries. For local PDF export, install the platform-specific Pango libraries.
    For running tests locally:
    ```bash
-   uv pip install --system -r requirements-dev.txt
-   # or: pip install -r requirements-dev.txt
+   uv pip install --system --require-hashes -r requirements-dev.lock
+   # or: pip install --require-hashes -r requirements-dev.lock
    ```
 3. Create a `.env` file from the example:
    ```bash
@@ -53,6 +51,16 @@ A Streamlit application that extracts audio from videos, transcribes it using As
    OPENROUTER_API_KEY=your_actual_openrouter_key
    ```
 
+5. Reset login passwords using a secure local prompt:
+   ```bash
+   python -m scripts.reset_passwords
+   ```
+   Existing local usernames are detected automatically. For new accounts, pass
+   usernames as arguments. The command writes Argon2id hashes to ignored
+   `secrets/users.json`; plaintext passwords are never printed or saved.
+   Set `APP_USERS_FILE=secrets/users.json` in `.env`. Legacy SHA-256 login records
+   are rejected, so this step is required before starting the hardened app.
+
 ## Usage
 
 1. Run the Streamlit app:
@@ -62,21 +70,34 @@ A Streamlit application that extracts audio from videos, transcribes it using As
 
 2. Open your browser and navigate to the provided URL (usually `http://localhost:8501`)
 
-3. If you've set up your `.env` file, the API keys will be loaded automatically. Otherwise, configure your API keys in the sidebar:
-   - Enter your AssemblyAI API key
-   - Enter your OpenRouter API key
-   - Select transcription language
-   - Enter OpenRouter model id (for example: `google/gemini-3-flash-preview`)
+3. Sign in with the reset credentials. Configure API keys, the model, and the
+   system prompt on the server; ordinary users cannot edit those settings.
+   Users can select the transcription language.
 
 4. Choose input source:
    - **Local upload** for small files (recommended <= 32 MB on Cloud Run)
-   - **Large file upload** for big files
+   - **Large file upload** for files up to 10 GiB
    - If `GCS_UPLOAD_BUCKET` and `APP_BASE_URL` are configured, use **Prepare secure browser upload** for UI-only large file upload.
 
 5. View the results:
    - Full transcript in the "Full Transcript" tab
    - AI-generated summary in the "AI Summary" tab
    - Download options for both transcript and summary (TXT/PDF)
+
+Security limits: 32 MiB through Streamlit, 10 GiB through GCS, 2 MiB for text,
+400,000 transcript characters, and four hours of audio. Cloud media is streamed
+through FFmpeg into a bounded mono MP3; the original video is never copied into
+the instance's memory-backed temporary storage. Paid processing is limited
+to 10 requests per account per hour with one heavy job at a time per process.
+Limits reset when the process is replaced; they are not a distributed billing cap.
+
+Transcription saves its provider job ID before waiting. If the 30-second wait
+expires, **Check transcription** resumes the same job without submitting or
+charging for another job. Errors remain visible and retain the lecture.
+After a browser refresh, signing in with the same account restores the latest
+lecture checkpoint on the current instance for up to six hours. Start over and
+logout discard that checkpoint. Instance replacement still loses checkpoints;
+shared durable storage is required for recovery across server restarts.
 
 ## Deployment
 
@@ -145,7 +166,7 @@ If you get an error about FFmpeg not being found:
 
 ### API Key Issues
 - Make sure your API keys are valid and have sufficient credits
-- Check that the keys are entered correctly in the sidebar or `.env` file
+- Check the server-side `.env` configuration or Secret Manager bindings
 - If using `.env` file, make sure it's in the same directory as `app.py`
 
 ### Large File Processing
@@ -154,14 +175,11 @@ If you get an error about FFmpeg not being found:
 - Cloud Run direct upload has request-size limits (413 errors). Use Large file upload mode for large files.
 
 ### GCS Permission Issues
-If large file upload fails with permission errors:
-1. Grant your Cloud Run runtime service account read access to the bucket/object.
-2. Example:
-   ```bash
-   gcloud storage buckets add-iam-policy-binding gs://MY_BUCKET \
-     --member="serviceAccount:PROJECT_NUMBER-compute@developer.gserviceaccount.com" \
-     --role="roles/storage.objectViewer"
-   ```
+If direct upload fails with permission errors, check the dedicated runtime
+identity and the conditional `uploads/` grants configured by `deploy.sh`.
+See [DEPLOYMENT.md](DEPLOYMENT.md). Do not grant bucket-wide read access to the
+Compute Engine default account as a workaround. Unsupported-size or expired
+uploads must be prepared again from the signed-in session.
 
 ## License
 

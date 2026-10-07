@@ -5,6 +5,7 @@
 # Documentation
 README.md
 *.md
+!data/system_prompt.md
 
 # Python
 __pycache__/
@@ -30,6 +31,13 @@ wheels/
 
 # Virtual environments
 .env
+.env.*
+.streamlit/secrets.toml
+secrets/
+.cache/
+.github/
+tests/
+scripts/
 .venv
 env/
 venv/

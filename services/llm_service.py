@@ -1,5 +1,6 @@
 from typing import Optional
 from openrouter import OpenRouter
+from config import Config
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -11,9 +12,8 @@ class LLMService:
     def __init__(self, api_key: Optional[str] = None, model: str = "google/gemini-3-flash-preview", **kwargs):
         self.model = model
         self.temperature = kwargs.get("temperature", 0)
-        self.max_tokens = kwargs.get("max_tokens", None)
-        self.timeout = kwargs.get("timeout", None)
-        self.max_retries = kwargs.get("max_retries", 2)
+        self.max_tokens = min(kwargs.get("max_tokens") or 8192, 8192)
+        self.timeout = min(kwargs.get("timeout") or 120, 120)
         self.http_referer = kwargs.get("http_referer")
         self.x_title = kwargs.get("x_title")
 
@@ -23,15 +23,10 @@ class LLMService:
         if self.http_referer:
             client_kwargs["http_referer"] = self.http_referer
         if self.x_title:
-            client_kwargs["x_title"] = self.x_title
+            client_kwargs["x_open_router_title"] = self.x_title
 
-        self.client = OpenRouter(**client_kwargs)
+        self.client = OpenRouter(timeout_ms=self.timeout * 1000, **client_kwargs)
         logger.info(f"LLMService initialized with OpenRouter model: {model}")
-
-        if self.timeout is not None:
-            logger.warning(
-                "OPENROUTER_TIMEOUT is set, but explicit timeout forwarding is not configured in current SDK integration."
-            )
 
     @staticmethod
     def _extract_content(response) -> str:
@@ -86,6 +81,8 @@ class LLMService:
         Returns:
             str: Summary of the text
         """
+        if len(text) > Config.MAX_TRANSCRIPT_CHARS:
+            raise ValueError("Transcript exceeds the supported length")
         if system_prompt is None:
             system_prompt = '''You are a helpful assistant that creates concise and informative summaries.
             Please provide a clear, well-structured summary of the given text, highlighting the main points and key information.'''
@@ -102,10 +99,13 @@ class LLMService:
                 messages=messages,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
-                retries=self.max_retries,
+                retries=None,
+                timeout_ms=self.timeout * 1000,
                 stream=False,
             )
             return self._extract_content(response)
         except Exception as e:
-            logger.error(f"LLM processing error: {str(e)}", exc_info=True)
-            raise RuntimeError(f"LLM processing error: {str(e)}") from e
+            logger.error("LLM processing failed: %s", type(e).__name__)
+            raise RuntimeError("LLM processing failed") from None
+        finally:
+            self.client.__exit__(None, None, None)

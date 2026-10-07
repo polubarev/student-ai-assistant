@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploys to Cloud Run using Podman + Artifact Registry + Secret Manager.
+# Deploys to Cloud Run using Docker or Podman + Artifact Registry + Secret Manager.
 set -euo pipefail
 
 # ------------------------------------------------------------------------------
@@ -15,9 +15,13 @@ SERVICE_MEMORY="${SERVICE_MEMORY:-1Gi}"
 SERVICE_CPU="${SERVICE_CPU:-1}"
 SERVICE_TIMEOUT="${SERVICE_TIMEOUT:-600}"
 EXECUTION_ENVIRONMENT="${EXECUTION_ENVIRONMENT:-gen2}"
+CONTAINER_ENGINE="${CONTAINER_ENGINE:-}"
 
 ASSEMBLYAI_SECRET_NAME="${ASSEMBLYAI_SECRET_NAME:-assemblyai-api-key}"
 OPENROUTER_SECRET_NAME="${OPENROUTER_SECRET_NAME:-openrouter-api-key}"
+APP_USERS_SECRET_NAME="${APP_USERS_SECRET_NAME:-app-users}"
+COOKIE_SECRET_NAME="${COOKIE_SECRET_NAME:-streamlit-cookie-secret}"
+APP_USERS_PATH="${APP_USERS_PATH:-secrets/users.json}"
 ENV_FILE="${ENV_FILE:-.env}"
 GCS_SOURCE_BUCKET="${GCS_SOURCE_BUCKET:-}"
 GCS_UPLOAD_BUCKET="${GCS_UPLOAD_BUCKET:-}"
@@ -84,38 +88,6 @@ upsert_secret() {
   fi
 }
 
-destroy_old_secret_versions() {
-  local secret_name="$1"
-  local keep_count="${2:-1}"
-  local versions=()
-
-  if ! gcloud secrets describe "${secret_name}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
-    return
-  fi
-
-  mapfile -t versions < <(
-    gcloud secrets versions list "${secret_name}" \
-      --project="${PROJECT_ID}" \
-      --filter="state=enabled OR state=disabled" \
-      --sort-by="~createTime" \
-      --format="value(name)"
-  )
-
-  if (( ${#versions[@]} <= keep_count )); then
-    echo "Secret ${secret_name}: ${#versions[@]} active version(s), nothing to clean up."
-    return
-  fi
-
-  echo "Secret ${secret_name}: keeping ${keep_count} newest active version(s), destroying older versions..."
-  for ((i = keep_count; i < ${#versions[@]}; i++)); do
-    gcloud secrets versions destroy "${versions[$i]}" \
-      --secret="${secret_name}" \
-      --project="${PROJECT_ID}" \
-      --quiet >/dev/null
-    echo "Destroyed old secret version: ${secret_name}/${versions[$i]}"
-  done
-}
-
 echo "Starting deploy with project=${PROJECT_ID}, region=${REGION}, service=${SERVICE_NAME}"
 echo "Cloud Run settings: memory=${SERVICE_MEMORY}, cpu=${SERVICE_CPU}, timeout=${SERVICE_TIMEOUT}s, env=${EXECUTION_ENVIRONMENT}"
 
@@ -137,7 +109,66 @@ if [[ -z "${GCS_SIGNER_SERVICE_ACCOUNT_EMAIL}" ]]; then
 fi
 
 require_cmd gcloud
-require_cmd podman
+if [[ -z "${CONTAINER_ENGINE}" ]]; then
+  if command -v docker >/dev/null 2>&1; then
+    CONTAINER_ENGINE=docker
+  else
+    CONTAINER_ENGINE=podman
+  fi
+fi
+if [[ "${CONTAINER_ENGINE}" != docker && "${CONTAINER_ENGINE}" != podman ]]; then
+  echo "CONTAINER_ENGINE must be docker or podman."
+  exit 1
+fi
+require_cmd "${CONTAINER_ENGINE}"
+if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; assert sys.version_info >= (3, 11)' >/dev/null 2>&1; then
+  PYTHON_CMD=(python3)
+elif command -v py >/dev/null 2>&1 && py -3 -c 'import sys; assert sys.version_info >= (3, 11)' >/dev/null 2>&1; then
+  PYTHON_CMD=(py -3)
+else
+  echo "Python 3.11 or newer is required."
+  exit 1
+fi
+# Git Bash must not convert the Cloud Run secret mount into a Windows path.
+export MSYS2_ARG_CONV_EXCL="${MSYS2_ARG_CONV_EXCL:+${MSYS2_ARG_CONV_EXCL};}/secrets/"
+
+if ! "${CONTAINER_ENGINE}" info >/dev/null 2>&1; then
+  echo "Start the ${CONTAINER_ENGINE} engine before deploying."
+  exit 1
+fi
+if [[ "${RUNTIME_SERVICE_ACCOUNT}" == *-compute@developer.gserviceaccount.com ]]; then
+  echo "Use a dedicated runtime service account, not the default Compute Engine identity."
+  exit 1
+fi
+
+# Validate a custom public origin before changing cloud resources.
+if [[ -n "${APP_BASE_URL}" ]]; then
+  "${PYTHON_CMD[@]}" - "${APP_BASE_URL}" <<'PY'
+from urllib.parse import urlparse
+import sys
+url = urlparse(sys.argv[1])
+if (url.scheme != "https" or not url.hostname or url.username or url.password
+        or url.query or url.fragment or url.path not in ("", "/") or url.port not in (None, 443)):
+    raise SystemExit("APP_BASE_URL must be an HTTPS origin on port 443")
+PY
+fi
+
+# Validate credentials before building or changing cloud resources.
+if [[ -f "${APP_USERS_PATH}" ]]; then
+  "${PYTHON_CMD[@]}" - "${APP_USERS_PATH}" <<'PY'
+import json, sys
+from pathlib import Path
+users = json.loads(Path(sys.argv[1]).read_text())
+if not isinstance(users, dict) or not users or any(
+    not isinstance(k, str) or not isinstance(v, str) or not v.startswith("$argon2id$")
+    for k, v in users.items()
+):
+    raise SystemExit("Reset all login passwords with scripts.reset_passwords before deploying.")
+PY
+elif ! gcloud secrets describe "${APP_USERS_SECRET_NAME}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  echo "Missing login credentials. Run python -m scripts.reset_passwords first."
+  exit 1
+fi
 
 CURRENT_ACCOUNT="$(gcloud config get-value account 2>/dev/null || true)"
 CURRENT_PROJECT="$(gcloud config get-value project 2>/dev/null || true)"
@@ -177,27 +208,31 @@ else
 fi
 
 # Podman VM is required on macOS.
-if [[ "$(uname -s)" == "Darwin" ]]; then
+if [[ "${CONTAINER_ENGINE}" == podman && "$(uname -s)" == "Darwin" ]]; then
   podman machine start >/dev/null 2>&1 || true
 fi
 
-echo "Authenticating Podman to Artifact Registry..."
+echo "Authenticating ${CONTAINER_ENGINE} to Artifact Registry..."
 TOKEN="$(gcloud auth print-access-token)"
-printf '%s' "${TOKEN}" | podman login "${REGION}-docker.pkg.dev" \
+printf '%s' "${TOKEN}" | "${CONTAINER_ENGINE}" login "${REGION}-docker.pkg.dev" \
   -u oauth2accesstoken \
   --password-stdin >/dev/null
 
-echo "Building container image with Podman..."
-podman build --platform linux/amd64 -t "${IMAGE_TAG}" .
+echo "Building container image with ${CONTAINER_ENGINE}..."
+"${CONTAINER_ENGINE}" build --platform linux/amd64 -t "${IMAGE_TAG}" .
 
 echo "Pushing container image..."
 # Use explicit options to avoid blob reuse/signature issues observed with Podman.
-podman push \
+if [[ "${CONTAINER_ENGINE}" == podman ]]; then
+  podman push \
   --format docker \
   --compression-format gzip \
   --force-compression \
   --remove-signatures \
-  "${IMAGE_TAG}"
+    "${IMAGE_TAG}"
+else
+  docker push "${IMAGE_TAG}"
+fi
 
 # Load API keys from environment first, then fallback to .env.
 ASSEMBLYAI_API_KEY="${ASSEMBLYAI_API_KEY:-}"
@@ -219,45 +254,52 @@ echo "Upserting secrets (if values are available)..."
 upsert_secret "${ASSEMBLYAI_SECRET_NAME}" "${ASSEMBLYAI_API_KEY}"
 upsert_secret "${OPENROUTER_SECRET_NAME}" "${OPENROUTER_API_KEY}"
 
-PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')"
-if [[ -z "${RUNTIME_SERVICE_ACCOUNT}" ]]; then
-  RUNTIME_SERVICE_ACCOUNT="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
-fi
-if [[ -z "${GCS_SIGNER_SERVICE_ACCOUNT_EMAIL}" ]]; then
-  GCS_SIGNER_SERVICE_ACCOUNT_EMAIL="${RUNTIME_SERVICE_ACCOUNT}"
-fi
-echo "Using runtime service account: ${RUNTIME_SERVICE_ACCOUNT}"
-echo "Granting Secret Manager access to Cloud Run runtime service account..."
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-  --member="serviceAccount:${RUNTIME_SERVICE_ACCOUNT}" \
-  --role="roles/secretmanager.secretAccessor" \
-  --quiet >/dev/null
-
-# Needed for generating signed GCS upload policies from Cloud Run without static key files.
-echo "Granting runtime service account token-creator on itself (for signed upload URLs)..."
-gcloud iam service-accounts add-iam-policy-binding "${RUNTIME_SERVICE_ACCOUNT}" \
-  --member="serviceAccount:${RUNTIME_SERVICE_ACCOUNT}" \
-  --role="roles/iam.serviceAccountTokenCreator" \
-  --project="${PROJECT_ID}" \
-  --quiet >/dev/null
-
-if [[ -n "${GCS_SOURCE_BUCKET}" ]]; then
-  if [[ "${GCS_SOURCE_BUCKET}" == gs://* ]]; then
-    GCS_BUCKET_URI="${GCS_SOURCE_BUCKET}"
+if [[ -f "${APP_USERS_PATH}" ]]; then
+  if gcloud secrets describe "${APP_USERS_SECRET_NAME}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+    gcloud secrets versions add "${APP_USERS_SECRET_NAME}" --data-file="${APP_USERS_PATH}" --project="${PROJECT_ID}" >/dev/null
   else
-    GCS_BUCKET_URI="gs://${GCS_SOURCE_BUCKET}"
+    gcloud secrets create "${APP_USERS_SECRET_NAME}" --data-file="${APP_USERS_PATH}" --replication-policy=automatic --project="${PROJECT_ID}" >/dev/null
   fi
-  if [[ -z "${GCS_UPLOAD_BUCKET}" ]]; then
-    GCS_UPLOAD_BUCKET="${GCS_BUCKET_URI#gs://}"
+fi
+if ! gcloud secrets describe "${COOKIE_SECRET_NAME}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  upsert_secret "${COOKIE_SECRET_NAME}" "$("${PYTHON_CMD[@]}" -c 'import secrets; print(secrets.token_hex(48))')"
+fi
+
+if [[ -z "${RUNTIME_SERVICE_ACCOUNT}" ]]; then
+  RUNTIME_SERVICE_ACCOUNT="student-ai-runtime@${PROJECT_ID}.iam.gserviceaccount.com"
+fi
+if [[ "${RUNTIME_SERVICE_ACCOUNT}" == *-compute@developer.gserviceaccount.com ]]; then
+  echo "Use a dedicated runtime service account, not the default Compute Engine identity."
+  exit 1
+fi
+if ! gcloud iam service-accounts describe "${RUNTIME_SERVICE_ACCOUNT}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  gcloud iam service-accounts create "${RUNTIME_SERVICE_ACCOUNT%%@*}" \
+    --display-name="Student AI runtime" --project="${PROJECT_ID}" >/dev/null
+fi
+GCS_SIGNER_SERVICE_ACCOUNT_EMAIL="${RUNTIME_SERVICE_ACCOUNT}"
+for secret_name in "${ASSEMBLYAI_SECRET_NAME}" "${OPENROUTER_SECRET_NAME}" "${APP_USERS_SECRET_NAME}" "${COOKIE_SECRET_NAME}"; do
+  if gcloud secrets describe "${secret_name}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+    gcloud secrets add-iam-policy-binding "${secret_name}" \
+      --member="serviceAccount:${RUNTIME_SERVICE_ACCOUNT}" \
+      --role="roles/secretmanager.secretAccessor" --project="${PROJECT_ID}" --quiet >/dev/null
   fi
-  echo "Granting Cloud Run runtime service account GCS read access on ${GCS_BUCKET_URI}..."
-  gcloud storage buckets add-iam-policy-binding "${GCS_BUCKET_URI}" \
-    --member="serviceAccount:${RUNTIME_SERVICE_ACCOUNT}" \
-    --role="roles/storage.objectViewer" >/dev/null
+done
+
+GCS_UPLOAD_BUCKET="${GCS_UPLOAD_BUCKET:-${GCS_SOURCE_BUCKET#gs://}}"
+GCS_UPLOAD_BUCKET="${GCS_UPLOAD_BUCKET#gs://}"
+if [[ -n "${GCS_UPLOAD_BUCKET}" ]]; then
+  gcloud iam service-accounts add-iam-policy-binding "${RUNTIME_SERVICE_ACCOUNT}" \
+    --member="serviceAccount:${RUNTIME_SERVICE_ACCOUNT}" --role="roles/iam.serviceAccountTokenCreator" \
+    --project="${PROJECT_ID}" --quiet >/dev/null
+  for role in roles/storage.objectCreator roles/storage.objectViewer; do
+    gcloud storage buckets add-iam-policy-binding "gs://${GCS_UPLOAD_BUCKET}" \
+      --member="serviceAccount:${RUNTIME_SERVICE_ACCOUNT}" --role="${role}" \
+      --condition="title=app_uploads,expression=resource.name.startsWith('projects/_/buckets/${GCS_UPLOAD_BUCKET}/objects/uploads/'),description=Application uploads only" >/dev/null
+  done
 fi
 
 echo "Deploying Cloud Run service..."
-SECRET_BINDINGS=()
+SECRET_BINDINGS=("/secrets/app-users/users.json=${APP_USERS_SECRET_NAME}:latest" "STREAMLIT_SERVER_COOKIE_SECRET=${COOKIE_SECRET_NAME}:latest")
 if gcloud secrets describe "${ASSEMBLYAI_SECRET_NAME}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
   SECRET_BINDINGS+=("ASSEMBLYAI_API_KEY=${ASSEMBLYAI_SECRET_NAME}:latest")
 fi
@@ -273,6 +315,9 @@ DEPLOY_CMD=(
   --allow-unauthenticated
   --port "${SERVICE_PORT}"
   --min-instances 0
+  --max-instances 1
+  --concurrency 4
+  --session-affinity
   --memory "${SERVICE_MEMORY}"
   --cpu "${SERVICE_CPU}"
   --timeout "${SERVICE_TIMEOUT}"
@@ -281,7 +326,7 @@ DEPLOY_CMD=(
   --project "${PROJECT_ID}"
 )
 
-ENV_BINDINGS=("STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false" "STREAMLIT_SERVER_ENABLE_CORS=false")
+ENV_BINDINGS=("STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=true" "STREAMLIT_SERVER_ENABLE_CORS=true" "APP_USERS_FILE=/secrets/app-users/users.json")
 if [[ -n "${GCS_UPLOAD_BUCKET}" ]]; then
   ENV_BINDINGS+=("GCS_UPLOAD_BUCKET=${GCS_UPLOAD_BUCKET}")
 fi
@@ -313,15 +358,25 @@ if [[ -z "${APP_BASE_URL}" ]]; then
   APP_BASE_URL="${SERVICE_URL}"
 fi
 
+APP_HOST="$("${PYTHON_CMD[@]}" - "${APP_BASE_URL}" <<'PY'
+from urllib.parse import urlparse
+import sys
+url = urlparse(sys.argv[1])
+if url.scheme != "https" or not url.hostname:
+    raise SystemExit("APP_BASE_URL must be a valid HTTPS URL")
+print(url.hostname)
+PY
+)"
+gcloud run services update "${SERVICE_NAME}" --region="${REGION}" --project="${PROJECT_ID}" \
+  --update-env-vars "STREAMLIT_BROWSER_SERVER_ADDRESS=${APP_HOST},STREAMLIT_BROWSER_SERVER_PORT=443" >/dev/null
+
 echo "Removing legacy OPENAI_API_KEY secret binding if present..."
 gcloud run services update "${SERVICE_NAME}" \
   --region "${REGION}" \
   --project "${PROJECT_ID}" \
   --remove-secrets "OPENAI_API_KEY" >/dev/null || true
 
-echo "Cleaning up old Secret Manager versions..."
-destroy_old_secret_versions "${ASSEMBLYAI_SECRET_NAME}" 1
-destroy_old_secret_versions "${OPENROUTER_SECRET_NAME}" 1
+# Retain prior secret versions so an operator can investigate or roll back a revision.
 
 if [[ -n "${GCS_UPLOAD_BUCKET}" && -n "${APP_BASE_URL}" ]]; then
   if [[ "${GCS_UPLOAD_BUCKET}" == gs://* ]]; then
@@ -345,7 +400,7 @@ if [[ -n "${GCS_UPLOAD_BUCKET}" && -n "${APP_BASE_URL}" ]]; then
 [
   {
     "origin": ${ORIGINS_JSON},
-    "method": ["PUT", "POST", "GET", "HEAD", "OPTIONS"],
+    "method": ["POST"],
     "responseHeader": ["Content-Type", "x-goog-resumable"],
     "maxAgeSeconds": 3600
   }

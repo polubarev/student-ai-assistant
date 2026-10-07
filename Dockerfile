@@ -7,8 +7,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     UV_PYTHON_DOWNLOADS=never \
-    UV_LINK_MODE=copy \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+    UV_LINK_MODE=copy
 
 # Install uv (fast Python package installer)
 COPY --from=ghcr.io/astral-sh/uv:0.7.22 /uv /uvx /bin/
@@ -17,6 +16,9 @@ COPY --from=ghcr.io/astral-sh/uv:0.7.22 /uv /uvx /bin/
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     fonts-dejavu-core \
+    libpango-1.0-0 \
+    libpangoft2-1.0-0 \
+    libharfbuzz-subset0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user for security
@@ -26,18 +28,17 @@ RUN groupadd -r appuser && useradd -r -g appuser appuser
 WORKDIR /app
 
 # Copy requirements first for better Docker layer caching
-COPY requirements.txt .
+COPY requirements.lock .
 
 # Install Python dependencies with uv (faster than pip)
-RUN uv pip install --system --no-cache -r requirements.txt
-
-# Install Chromium for Playwright-based Markdown->PDF rendering
-RUN mkdir -p "${PLAYWRIGHT_BROWSERS_PATH}" \
-    && playwright install --with-deps chromium \
-    && chmod -R a+rX "${PLAYWRIGHT_BROWSERS_PATH}"
+RUN uv pip install --system --no-cache --require-hashes -r requirements.lock
 
 # Copy application code
-COPY . .
+COPY app.py config.py ./
+COPY services ./services
+COPY utils ./utils
+COPY data ./data
+COPY .streamlit/config.toml ./.streamlit/config.toml
 
 # Create necessary directories and set permissions
 RUN mkdir -p /app/temp /app/logs \
@@ -54,8 +55,8 @@ ENV STREAMLIT_SERVER_PORT=8501 \
     STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
     STREAMLIT_SERVER_HEADLESS=true \
     STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
-    STREAMLIT_SERVER_ENABLE_CORS=false \
-    STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false
+    STREAMLIT_SERVER_ENABLE_CORS=true \
+    STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=true
 
 # Command to run the application
 CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]

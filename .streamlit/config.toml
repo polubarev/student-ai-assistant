@@ -1,2 +1,6 @@
 [server]
 maxUploadSize = 32
+enableCORS = true
+enableXsrfProtection = true
+enableStaticServing = false
+disconnectedSessionTTL = 1800

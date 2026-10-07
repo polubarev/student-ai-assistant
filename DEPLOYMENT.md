@@ -1,16 +1,17 @@
-# GCP Deployment Runbook (Cloud Run + Podman)
+# GCP Deployment Runbook (Cloud Run + Docker or Podman)
 
 This runbook documents the deployment path that worked and the errors to avoid.
 
-## Final Known-Good Setup
+## Deployment configuration (production validation required)
 
 - Project: `ai-student-assistant-v2`
 - Region: `us-east1`
 - Registry: Artifact Registry (`${REGION}-docker.pkg.dev`)
-- Runtime: Cloud Run (`min-instances=0`)
-- Secrets: Google Secret Manager (`assemblyai-api-key`, `openrouter-api-key`)
-- Image build/push: Podman (local)
-- PDF export: Playwright + Chromium (installed in image build)
+- Runtime: Cloud Run (`min-instances=0`, `max-instances=1`, concurrency 4, session affinity)
+- Secrets: Google Secret Manager (`assemblyai-api-key`, `openrouter-api-key`, `app-users`, `streamlit-cookie-secret`)
+- Runtime identity: dedicated `student-ai-runtime` service account with resource-scoped grants
+- Image build/push: Docker or Podman (local; automatically detected)
+- PDF export: static WeasyPrint worker with Pango, no external resources, and CPU/memory/time limits
 
 ## Why This Path
 
@@ -30,18 +31,31 @@ gcloud auth login --update-adc
 gcloud config set project ai-student-assistant-v2
 ```
 
-3. Ensure Podman works:
+3. Start the installed container engine. For Docker Desktop:
 ```bash
-podman machine start
+docker desktop start
 ```
+Alternatively, use Podman. `CONTAINER_ENGINE=podman` selects it explicitly.
 
-4. Give Cloud Run runtime service account access to lecture files in GCS:
+4. Reset all login passwords locally before the first hardened deployment:
 ```bash
-PROJECT_NUMBER="$(gcloud projects describe ai-student-assistant-v2 --format='value(projectNumber)')"
-gcloud storage buckets add-iam-policy-binding gs://MY_LECTURES_BUCKET \
-  --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
-  --role="roles/storage.objectViewer"
+python -m scripts.reset_passwords
 ```
+The ignored `secrets/users.json` is uploaded to the `app-users` Secret Manager
+secret and mounted at `/secrets/app-users/users.json`. The app reads it through
+`APP_USERS_FILE`. Subsequent deployments can reuse the managed secret if the
+local file is absent. Never use the committed SHA-256 credentials with this version.
+
+5. Use Python 3.11 or newer (`python3`, or `py -3` on Windows). The script uses
+Python to generate random secret material and does not require OpenSSL. A
+shared, randomly generated Streamlit cookie secret is created once in Secret
+Manager and bound as `STREAMLIT_SERVER_COOKIE_SECRET`.
+
+On this Windows workspace, use Git Bash from `C:/Program Files/Git/bin/bash.exe`.
+The script supports the Windows Python launcher and preserves the Cloud Run
+secret mount path when invoked through Git Bash. If Google Cloud TLS verification
+fails despite a configured account, use the machine's trusted CA bundle through
+`CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE`; keep certificate verification enabled.
 
 ## Recommended Deploy Command
 
@@ -50,30 +64,78 @@ From repo root:
 bash deploy.sh
 ```
 
-If you want the script to grant bucket read access automatically:
+For direct browser uploads, set the dedicated upload bucket:
 ```bash
-GCS_SOURCE_BUCKET=MY_LECTURES_BUCKET bash deploy.sh
+GCS_UPLOAD_BUCKET=MY_UPLOAD_BUCKET bash deploy.sh
 ```
+`deploy.sh` sets `APP_BASE_URL` to the service URL automatically unless a custom
+HTTPS URL is supplied. It grants the runtime identity object creation and viewing
+only for the bucket's `uploads/` prefix. The app additionally permits reads only
+of the exact object issued to the current authenticated session. General lecture
+bucket browsing and arbitrary `gs://` imports are no longer supported.
 
-For UI-only large uploads (no manual `gs://` for users), also set:
-```bash
-GCS_SOURCE_BUCKET=MY_LECTURES_BUCKET \
-GCS_UPLOAD_BUCKET=MY_LECTURES_BUCKET \
-bash deploy.sh
-```
-`deploy.sh` will set `APP_BASE_URL` to the service URL automatically.
+The script builds from the hashed `requirements.lock`, creates the dedicated
+runtime service account, grants access on the four individual secrets, mounts the
+user credential file, enables Streamlit CORS/XSRF, and enables session affinity.
+GCS CORS permits POST from the application origin; signed uploads have a 10 GiB
+policy limit and no unrestricted PUT fallback. Prior secret versions are retained
+for investigation and controlled rollback.
 
-The script now does all of this:
-- enables required APIs (`run`, `artifactregistry`, `secretmanager`)
-- ensures repository exists
-- authenticates Podman to Artifact Registry
-- builds + pushes image
-- installs Chromium in the image for Markdown->PDF export
-- creates/updates secret versions from env values
-- grants secret access to Cloud Run runtime service account
-- grants `roles/iam.serviceAccountTokenCreator` on runtime service account (required for signed browser upload forms)
-- configures bucket CORS for your app origin (required when upload uses signed `PUT` fallback)
-- deploys Cloud Run with secret bindings and `min-instances=0`
+The multipart form sends an explicit `Content-Type` field before the file, as
+required to preserve the media type in [GCS HTML uploads](https://docs.cloud.google.com/storage/docs/xml-api/post-object-forms).
+Media type is used for routing; FFprobe validates media duration and format before
+extraction or transcription. The app signs a generation-pinned GCS GET URL after
+checking the session's exact object grant. FFmpeg streams cloud media into mono
+32 kbps MP3 (up to four hours, bounded to 128 MiB), keeping the original large
+file out of Cloud Run's RAM-backed filesystem. Signed URLs are never logged.
+
+The script does not remove grants from the old Compute Engine identity, which may
+be shared by other services. After switching revisions, an operator must review
+and remove unnecessary old grants with that impact in mind. An explicit default
+Compute Engine `RUNTIME_SERVICE_ACCOUNT` is rejected; remove it from `.env` or
+select a dedicated identity.
+
+Only one instance is configured because authentication/job limits and Streamlit
+sessions are stored in process memory. Affinity remains best effort, and quotas
+reset after replacement. Before increasing replicas, move quotas and durable
+ownership records to shared storage. Reconnects retain the Streamlit session for
+30 minutes; after a page refresh, authenticated per-user local checkpoints allow
+recovery on the same instance for six hours. Logout and start-over remove the
+checkpoint. A session lost during replacement needs a
+new upload; knowledge of an old object path does not grant access to it.
+
+PDF export uses a static, bounded worker. The Chromium sandbox check failed in
+the container; the release therefore avoids launching a browser. External resource
+loading is denied, Markdown HTML is escaped, and worker CPU/memory/time limits are
+applied. WeasyPrint is pinned to an audited release.
+
+## Cloud Build rollout used for this release
+
+The active revision is `student-ai-assistant-service-00050-cej` on 100% traffic.
+Docker Desktop could not start locally. A dedicated `student-ai-builder` identity
+built the credential-free allowlist bundle in Cloud Build and ran all 36 Linux
+tests plus a real, network-disabled PDF check.
+
+`scripts/build_cloud.py` submits the remote build. `scripts/deploy_cloud.py`
+prepares scoped permissions and managed secrets, stages a no-traffic revision,
+creates a production-credential revision from the validated image digest, and
+promotes only after live checks attest to that same digest. Local rollout state
+and fixtures are stored in ignored directories. On this workspace, the pipeline
+is run with the `.venv` Python and trusted CA bundle documented above.
+
+`scripts/verify_live.py` uses disposable accounts and synthetic lecture content.
+It verifies the signed upload policy, GCS upload/read, cross-user/session behavior,
+summarization, PDF downloads, and foreign-origin WebSocket rejection. Temporary
+credential versions are disabled, their runtime grant removed, and old revision
+tags cleared after promotion. `scripts/verify_speech.py` additionally checked the
+release transcription client with synthetic audio and deleted its temporary job
+and audio object.
+
+The retired default account's broad grants were not removed: automatic approval
+review blocked revocation, and the user chose to retain them for a separate
+workload review.
+The production service uses the restricted dedicated identity. See
+[SECURITY_REVIEW.md](SECURITY_REVIEW.md) for the recorded remaining work.
 
 ## Cloud Run Resource Knobs
 
@@ -166,13 +228,12 @@ Expected minScale: `0`.
 
 5. `Blob object has no attribute generate_signed_post_policy_v4`
 - Cause: older `google-cloud-storage` runtime API surface.
-- Fix: app now falls back to signed `PUT` upload automatically. Redeploy latest code.
+- Fix: rebuild from the locked dependencies and use the storage client's signed POST policy API. Signing failures stop the upload; there is no PUT fallback.
 
-6. PDF download fails with browser-not-found / launch errors
-- Cause: runtime can’t find Chromium binaries used by Playwright.
-- Fix:
-  - Use latest Dockerfile (sets shared `PLAYWRIGHT_BROWSERS_PATH` and installs Chromium in build).
-  - Rebuild and redeploy with `bash deploy.sh`.
+6. PDF export fails
+- Check the static worker's Pango dependencies and resource limits.
+- Rebuild from the locked dependencies; do not enable external URL fetching.
+- TXT downloads remain available if PDF rendering fails.
 
 ## Security Notes
 

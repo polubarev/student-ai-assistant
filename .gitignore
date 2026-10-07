@@ -198,6 +198,8 @@ Thumbs.db
 *.lnk
 
 # API Keys and secrets
+.streamlit/secrets.toml
+secrets/
 .env.local
 .env.production
 .env.staging

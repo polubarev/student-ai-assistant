@@ -31,16 +31,14 @@ class Config:
     OPENROUTER_MAX_TOKENS: Optional[int] = (
         int(os.getenv("OPENROUTER_MAX_TOKENS") or os.getenv("OPENAI_MAX_TOKENS"))
         if (os.getenv("OPENROUTER_MAX_TOKENS") or os.getenv("OPENAI_MAX_TOKENS"))
-        else None
+        else 8192
     )
     OPENROUTER_TIMEOUT: Optional[int] = (
         int(os.getenv("OPENROUTER_TIMEOUT") or os.getenv("OPENAI_TIMEOUT"))
         if (os.getenv("OPENROUTER_TIMEOUT") or os.getenv("OPENAI_TIMEOUT"))
-        else None
+        else 120
     )
-    OPENROUTER_MAX_RETRIES: int = int(
-        os.getenv("OPENROUTER_MAX_RETRIES") or os.getenv("OPENAI_MAX_RETRIES") or "2"
-    )
+    OPENROUTER_MAX_RETRIES: int = 0
     OPENROUTER_HTTP_REFERER: Optional[str] = os.getenv("OPENROUTER_HTTP_REFERER")
     OPENROUTER_X_TITLE: Optional[str] = os.getenv("OPENROUTER_X_TITLE") or "Student AI Assistant"
     
@@ -49,6 +47,14 @@ class Config:
     
     # FFmpeg Configuration
     FFMPEG_PATH: str = os.getenv("FFMPEG_PATH", "ffmpeg")
+    MAX_UPLOAD_BYTES: int = 10 * 1024 * 1024 * 1024
+    MAX_AUDIO_BYTES: int = 128 * 1024 * 1024
+    MAX_TEXT_BYTES: int = 2 * 1024 * 1024
+    MAX_TRANSCRIPT_CHARS: int = 400_000
+    MAX_AUDIO_SECONDS: int = 4 * 3600
+    PROCESS_TIMEOUT_SECONDS: int = 180
+    MEDIA_PROCESS_TIMEOUT_SECONDS: int = 1800
+    TRANSCRIPTION_POLL_SECONDS: int = 30
 
     # GCS upload flow (for large files on Cloud Run)
     GCS_UPLOAD_BUCKET: Optional[str] = os.getenv("GCS_UPLOAD_BUCKET")

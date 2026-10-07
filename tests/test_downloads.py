@@ -2,6 +2,8 @@
 
 import ast
 import base64
+from contextlib import nullcontext
+import hashlib
 from pathlib import Path
 import re
 import unittest
@@ -57,6 +59,8 @@ def _render_results():
         "st": st,
         "build_summary_pdf_bytes": lambda _: b"%PDF-1.4\nfixture",
         "logger": type("Logger", (), {"exception": lambda *_: None})(),
+        "hashlib": hashlib,
+        "processing_slot": nullcontext,
     }
     namespace["build_download_link"] = build_download_link
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(APP_PATH), "exec"), namespace)

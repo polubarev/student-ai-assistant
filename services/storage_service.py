@@ -5,12 +5,31 @@ from uuid import uuid4
 import os
 import logging
 from urllib.request import Request as UrlRequest, urlopen
+from config import Config
 
 import google.auth
 from google.cloud import storage
+from google.cloud.storage.retry import DEFAULT_RETRY
 from google.auth.transport.requests import Request
 
 logger = logging.getLogger(__name__)
+
+
+class _BoundedWriter:
+    def __init__(self, output, limit):
+        self.output = output
+        self.limit = limit
+        self.written = 0
+
+    def write(self, data):
+        if self.written + len(data) > self.limit:
+            raise ValueError("Download exceeds the supported size")
+        count = self.output.write(data)
+        self.written += count
+        return count
+
+    def __getattr__(self, name):
+        return getattr(self.output, name)
 
 
 class GCSStorageService:
@@ -34,32 +53,69 @@ class GCSStorageService:
             raise ValueError("Invalid GCS URI. Expected format: gs://bucket/path/file.ext")
         return bucket, blob_name
 
-    def download_to_path(self, gcs_uri: str, destination_path: Path) -> Dict[str, str | int]:
-        """Download object from GCS URI to local destination path."""
+    def download_to_path(
+        self, gcs_uri: str, destination_path: Path, *, expected_bucket: str,
+        expected_object: str, max_size_bytes: int, max_text_bytes: int,
+    ) -> Dict[str, str | int]:
+        """Download one authorized, size-checked generation; never list other objects."""
         bucket_name, blob_name = self.parse_gcs_uri(gcs_uri)
-        bucket = self.client.bucket(bucket_name)
-        blob = bucket.get_blob(blob_name)
+        if (bucket_name, blob_name) != (expected_bucket, expected_object):
+            raise PermissionError("Object does not match the authorized upload")
+        blob = self.client.bucket(bucket_name).get_blob(blob_name, timeout=30, retry=DEFAULT_RETRY.with_deadline(30))
         if blob is None:
-            raise FileNotFoundError(f"GCS object not found: {gcs_uri}")
-
-        destination_path.parent.mkdir(parents=True, exist_ok=True)
-        blob.download_to_filename(str(destination_path))
-
-        # Defensive fallback: in some flows blob metadata can be partially missing.
-        # Use downloaded file size so UI always shows a correct size.
-        size_bytes = int(blob.size) if blob.size is not None else int(destination_path.stat().st_size)
-
+            raise FileNotFoundError("Uploaded object is not available yet")
+        limit = max_size_bytes
+        if (blob.content_type or "").startswith("text/") or blob_name.lower().endswith(".txt"):
+            limit = min(limit, max_text_bytes)
+        if blob.size is None or not 0 < int(blob.size) <= limit or blob.generation is None:
+            raise ValueError("Uploaded object exceeds the supported size or has invalid metadata")
+        destination_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        created = False
+        try:
+            with destination_path.open("xb") as output:
+                created = True
+                blob.download_to_file(
+                    _BoundedWriter(output, limit), if_generation_match=blob.generation,
+                    raw_download=True, timeout=60, retry=DEFAULT_RETRY.with_deadline(60),
+                )
+            if destination_path.stat().st_size != int(blob.size):
+                raise ValueError("Uploaded object size changed")
+        except Exception:
+            if created:
+                destination_path.unlink(missing_ok=True)
+            raise
         return {
             "name": Path(blob_name).name,
-            "size": size_bytes,
+            "size": int(blob.size),
             "content_type": blob.content_type or "",
             "updated": blob.updated.isoformat() if blob.updated else "",
+            "generation": str(blob.generation),
         }
 
-    def list_object_names(self, bucket_name: str, prefix: str = "", max_results: int = 10) -> list[str]:
-        """List object names in a bucket for diagnostics."""
-        blobs = self.client.list_blobs(bucket_name, prefix=prefix, max_results=max_results)
-        return [str(blob.name) for blob in blobs]
+    def media_metadata(self, gcs_uri, *, expected_bucket, expected_object):
+        """Inspect an authorized generation without copying media into RAM-backed /tmp."""
+        bucket, key = self.parse_gcs_uri(gcs_uri)
+        if (bucket, key) != (expected_bucket, expected_object):
+            raise PermissionError("Object does not match the authorized upload")
+        blob = self.client.bucket(bucket).get_blob(key, timeout=30, retry=DEFAULT_RETRY.with_deadline(30))
+        if blob is None:
+            raise FileNotFoundError("Uploaded object is not available yet")
+        if blob.size is None or not 0 < int(blob.size) <= Config.MAX_UPLOAD_BYTES or blob.generation is None:
+            raise ValueError("Uploaded object exceeds the supported size or has invalid metadata")
+        return {"name": Path(key).name, "size": int(blob.size),
+                "content_type": blob.content_type or "", "generation": str(blob.generation)}
+
+    def signed_media_url(self, gcs_uri, *, expected_bucket, expected_object, generation):
+        """Create a short-lived read URL for the exact, previously inspected generation."""
+        bucket, key = self.parse_gcs_uri(gcs_uri)
+        if (bucket, key) != (expected_bucket, expected_object) or not str(generation).isdigit():
+            raise PermissionError("Object does not match the authorized upload")
+        email, token = self._get_signing_identity()
+        return self.client.bucket(bucket).blob(key).generate_signed_url(
+            version="v4", expiration=timedelta(hours=1), method="GET",
+            query_parameters={"generation": str(generation)},
+            service_account_email=email, access_token=token,
+        )
 
     @staticmethod
     def _is_valid_service_account_email(value: str | None) -> bool:
@@ -128,137 +184,25 @@ class GCSStorageService:
         return service_account_email, access_token
 
     def create_signed_upload_form(
-        self,
-        bucket_name: str,
-        key_prefix: str,
-        success_redirect_url: str,
-        expiration_minutes: int = 10,
-        max_size_bytes: int = 10 * 1024 * 1024 * 1024,  # 10 GB
+        self, bucket_name: str, key_prefix: str, success_redirect_url: str,
+        expiration_minutes: int = 60, max_size_bytes: int = Config.MAX_UPLOAD_BYTES,
     ) -> Dict[str, object]:
-        """
-        Create a V4 signed POST policy for direct browser upload to GCS.
-        """
-        if not bucket_name:
-            raise ValueError("bucket_name is required")
-        if not key_prefix:
-            raise ValueError("key_prefix is required")
-        if not success_redirect_url:
-            raise ValueError("success_redirect_url is required")
-
-        expires_at = datetime.now(timezone.utc) + timedelta(minutes=expiration_minutes)
-        bucket = self.client.bucket(bucket_name)
+        """Issue only a size-limited POST policy. Fail closed if signing fails."""
+        if not bucket_name or not key_prefix or not success_redirect_url or max_size_bytes <= 0:
+            raise ValueError("Invalid upload configuration")
         object_key = f"{key_prefix}upload-{uuid4().hex}.bin"
-        blob = bucket.blob(object_key)
         service_account_email, access_token = self._get_signing_identity()
-
-        logger.info(
-            "Preparing signed upload form: bucket=%s key_prefix=%s storage_version=%s client_has_post=%s blob_has_post=%s",
-            bucket_name,
-            key_prefix,
-            getattr(storage, "__version__", "unknown"),
-            hasattr(self.client, "generate_signed_post_policy_v4"),
-            hasattr(blob, "generate_signed_post_policy_v4"),
-        )
-
-        post_conditions = [
-            ["eq", "$key", object_key],
-            ["content-length-range", 1, max_size_bytes],
-        ]
-        post_fields = {
-            "key": object_key,
-            "success_action_status": "201",
-        }
-
-        # Preferred path: signed POST policy (no JS upload code needed).
-        if hasattr(self.client, "generate_signed_post_policy_v4"):
-            try:
-                policy = self.client.generate_signed_post_policy_v4(
-                    bucket_name=bucket_name,
-                    blob_name=object_key,
-                    expiration=timedelta(minutes=expiration_minutes),
-                    conditions=post_conditions,
-                    fields=post_fields,
-                    service_account_email=service_account_email,
-                    access_token=access_token,
-                )
-                logger.info("Using signed POST policy via storage client method.")
-                return {
-                    "mode": "post",
-                    "url": policy["url"],
-                    "fields": policy["fields"],
-                    "expires_at": expires_at.strftime("%Y-%m-%d %H:%M:%S"),
-                    "bucket_name": bucket_name,
-                    "key_prefix": key_prefix,
-                    "object_key": object_key,
-                    "success_redirect_url": success_redirect_url,
-                }
-            except TypeError:
-                # Older client versions may not support named kwargs for this method.
-                try:
-                    policy = self.client.generate_signed_post_policy_v4(
-                        bucket_name,
-                        object_key,
-                        timedelta(minutes=expiration_minutes),
-                        conditions=post_conditions,
-                        fields=post_fields,
-                        service_account_email=service_account_email,
-                        access_token=access_token,
-                    )
-                    logger.info("Using signed POST policy via storage client method (positional args).")
-                    return {
-                        "mode": "post",
-                        "url": policy["url"],
-                        "fields": policy["fields"],
-                        "expires_at": expires_at.strftime("%Y-%m-%d %H:%M:%S"),
-                        "bucket_name": bucket_name,
-                        "key_prefix": key_prefix,
-                        "object_key": object_key,
-                        "success_redirect_url": success_redirect_url,
-                    }
-                except Exception:
-                    logger.exception("Client signed POST policy generation failed, trying blob method.")
-            except Exception:
-                logger.exception("Client signed POST policy generation failed, trying blob method.")
-
-        if hasattr(blob, "generate_signed_post_policy_v4"):
-            try:
-                policy = blob.generate_signed_post_policy_v4(
-                    expiration=timedelta(minutes=expiration_minutes),
-                    service_account_email=service_account_email,
-                    access_token=access_token,
-                    conditions=post_conditions,
-                    fields=post_fields,
-                )
-                logger.info("Using signed POST policy via blob method.")
-                return {
-                    "mode": "post",
-                    "url": policy["url"],
-                    "fields": policy["fields"],
-                    "expires_at": expires_at.strftime("%Y-%m-%d %H:%M:%S"),
-                    "bucket_name": bucket_name,
-                    "key_prefix": key_prefix,
-                    "object_key": object_key,
-                    "success_redirect_url": success_redirect_url,
-                }
-            except Exception:
-                logger.exception("Blob signed POST policy generation failed, falling back to PUT URL.")
-
-        # Compatibility fallback: signed PUT URL.
-        put_blob = bucket.blob(object_key)
-        upload_url = put_blob.generate_signed_url(
-            version="v4",
-            method="PUT",
+        policy = self.client.generate_signed_post_policy_v4(
+            bucket_name=bucket_name, blob_name=object_key,
             expiration=timedelta(minutes=expiration_minutes),
-            service_account_email=service_account_email,
-            access_token=access_token,
+            conditions=[["eq", "$key", object_key], ["content-length-range", 1, max_size_bytes],
+                        ["starts-with", "$Content-Type", ""]],
+            fields={"key": object_key, "success_action_status": "201"},
+            service_account_email=service_account_email, access_token=access_token,
         )
-        logger.warning("Falling back to signed PUT URL upload path.")
         return {
-            "mode": "put",
-            "url": upload_url,
-            "fields": {},
-            "expires_at": expires_at.strftime("%Y-%m-%d %H:%M:%S"),
-            "bucket_name": bucket_name,
-            "object_key": object_key,
-            "success_redirect_url": success_redirect_url,
+            "mode": "post", "url": policy["url"], "fields": policy["fields"],
+            "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=expiration_minutes)).isoformat(),
+            "bucket_name": bucket_name, "object_key": object_key,
+            "success_redirect_url": success_redirect_url, "max_size_bytes": max_size_bytes,
         }

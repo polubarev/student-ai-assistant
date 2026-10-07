@@ -23,13 +23,14 @@ def test_summarize_text_success(mock_openrouter_client):
 
     summary = llm_service.summarize_text("Some long text to summarize.")
 
-    mock_class.assert_called_once_with(api_key="fake_api_key")
+    mock_class.assert_called_once_with(api_key="fake_api_key", timeout_ms=120000)
     mock_instance.chat.send.assert_called_once()
     send_kwargs = mock_instance.chat.send.call_args.kwargs
     assert send_kwargs["model"] == "google/gemini-3-flash-preview"
     assert send_kwargs["temperature"] == 0
-    assert send_kwargs["max_tokens"] is None
-    assert send_kwargs["retries"] == 2
+    assert send_kwargs["max_tokens"] == 8192
+    assert send_kwargs["retries"] is None
+    assert send_kwargs["timeout_ms"] == 120000
     assert send_kwargs["stream"] is False
     assert summary == "This is a mock summary."
 
@@ -42,5 +43,5 @@ def test_summarize_text_api_error(mock_openrouter_client):
 
     llm_service = LLMService(api_key="fake_api_key")
 
-    with pytest.raises(RuntimeError, match="LLM processing error: API Error"):
+    with pytest.raises(RuntimeError, match="LLM processing failed"):
         llm_service.summarize_text("Some text.")
